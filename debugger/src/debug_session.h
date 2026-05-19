@@ -109,6 +109,10 @@ private:
                         int line, int col);
     json::Value js_value_to_remote_object(JSContext* ctx, JSValue val,
                                            const std::string& group) const;
+    json::Value js_value_to_remote_object(JSContext* ctx, JSValue val,
+                                           const std::string& group,
+                                           std::map<void*, std::string>& seen_objects) const;
+    std::string make_object_id() const;
     std::string store_object(const std::string& group, json::Value props) const;
     std::string find_script_id(const std::string& filename) const;
 

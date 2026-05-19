@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(qjs_debugger LANGUAGES C CXX)
 
+enable_testing()
+
 # MSVC < 17.5 (cl < 19.35) does not ship <stdatomic.h> for C.
 # Inject a shim directory so that #include <stdatomic.h> in QuickJS
 # picks up our compatibility header instead of failing.

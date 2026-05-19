@@ -331,6 +331,13 @@ void DebugSession::on_disconnect() {
 
 json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
                                                       const std::string& group) const {
+    std::map<void*, std::string> seen_objects;
+    return js_value_to_remote_object(ctx, val, group, seen_objects);
+}
+
+json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
+                                                      const std::string& group,
+                                                      std::map<void*, std::string>& seen_objects) const {
     auto obj = json::Value::object();
 
     if (JS_IsUndefined(val)) {
@@ -379,6 +386,18 @@ json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
         obj.set("subtype", "array");
         obj.set("className", "Array");
 
+        void* object_ptr = JS_VALUE_GET_PTR(val);
+        auto seen_it = seen_objects.find(object_ptr);
+        if (seen_it != seen_objects.end()) {
+            obj.set("description", "Array");
+            obj.set("objectId", seen_it->second);
+            return obj;
+        }
+
+        std::string oid = make_object_id();
+        seen_objects[object_ptr] = oid;
+        object_store_[oid] = json::Value::array();
+
         // Get array length and elements
         JSValue len_val = JS_GetPropertyStr(ctx, val, "length");
         int32_t len = 0;
@@ -393,7 +412,7 @@ json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
             JSValue elem = JS_GetPropertyUint32(ctx, val, i);
             auto prop = json::Value::object();
             prop.set("name", std::to_string(i));
-            prop.set("value", js_value_to_remote_object(ctx, elem, group));
+            prop.set("value", js_value_to_remote_object(ctx, elem, group, seen_objects));
             prop.set("writable", true);
             prop.set("configurable", true);
             prop.set("enumerable", true);
@@ -415,11 +434,23 @@ json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
         len_prop.set("isOwn", true);
         props.push(len_prop);
 
-        std::string oid = store_object(group, props);
+        object_store_[oid] = props;
         obj.set("objectId", oid);
     } else if (JS_IsObject(val)) {
         obj.set("type", "object");
         obj.set("className", "Object");
+
+        void* object_ptr = JS_VALUE_GET_PTR(val);
+        auto seen_it = seen_objects.find(object_ptr);
+        if (seen_it != seen_objects.end()) {
+            obj.set("description", "Object");
+            obj.set("objectId", seen_it->second);
+            return obj;
+        }
+
+        std::string oid = make_object_id();
+        seen_objects[object_ptr] = oid;
+        object_store_[oid] = json::Value::array();
 
         // Get own property names
         JSPropertyEnum* props_enum = nullptr;
@@ -434,7 +465,7 @@ json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
                 if (pname) {
                     auto prop = json::Value::object();
                     prop.set("name", pname);
-                    prop.set("value", js_value_to_remote_object(ctx, pval, group));
+                    prop.set("value", js_value_to_remote_object(ctx, pval, group, seen_objects));
                     prop.set("writable", true);
                     prop.set("configurable", true);
                     prop.set("enumerable", true);
@@ -450,7 +481,7 @@ json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
         }
 
         obj.set("description", "Object");
-        std::string oid = store_object(group, props);
+        object_store_[oid] = props;
         obj.set("objectId", oid);
     } else {
         obj.set("type", "undefined");
@@ -459,8 +490,12 @@ json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
     return obj;
 }
 
+std::string DebugSession::make_object_id() const {
+    return "{\"ordinal\":" + std::to_string(next_obj_id_++) + ",\"injectedScriptId\":1}";
+}
+
 std::string DebugSession::store_object(const std::string& group, json::Value props) const {
-    std::string oid = "{\"ordinal\":" + std::to_string(next_obj_id_++) + ",\"injectedScriptId\":1}";
+    std::string oid = make_object_id();
     object_store_[oid] = std::move(props);
     return oid;
 }
