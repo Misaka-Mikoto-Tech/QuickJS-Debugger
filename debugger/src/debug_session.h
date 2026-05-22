@@ -87,7 +87,7 @@ public:
 
     // --- QuickJS debug trace handler (OP_debug callback) ---
     static int debug_trace_handler(JSContext *ctx,
-                          const char *filename, const char *funcname,
+                          JSAtom filename, JSAtom funcname,
                           int line, int col,
                           void *opaque);
 

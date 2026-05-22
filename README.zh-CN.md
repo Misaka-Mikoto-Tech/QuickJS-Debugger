@@ -59,6 +59,7 @@ jsTest/
   ┌────────▼────────┐
   │   QuickJS 引擎   │  执行 JS 脚本，通过调试回调触发
   │  ─ JS_SetDebugTraceHandler()     设置/清除调试跟踪回调
+  │  ─ JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, opaque)
   │  ─ OP_debug opcode               语句边界触发回调
   │  ─ JS_GetStackDepth()            获取调用栈深度
   │  ─ JS_GetLocalVariablesAtLevel() 获取指定层级局部变量
@@ -122,6 +123,7 @@ make -j$(nproc)
 
 - **MSVC < 17.5**：自动注入 `compat/msvc/stdatomic.h` 垫片解决缺失 C11 `<stdatomic.h>` 的问题
 - **无需编译时宏**：调试接口使用专用的 `OP_debug` 操作码，始终在语句边界发射。未设置处理程序时运行时开销几乎为零（仅一次 `unlikely` 分支判断）。可随时通过 `JS_SetDebugTraceHandler()` 挂载处理程序。`DIRECT_DISPATCH`（computed goto）保持完全启用。
+- **`JSDebugTraceFunc` 回调签名**：`filename` 和 `funcname` 现在以 `JSAtom` 形式传入（而非 `const char*`）。在回调内部通过 `JS_AtomToCString()` / `JS_FreeCString()` 按需转换为字符串。若仅需与已知断点位置比较，可直接对比 atom 值，无需堆分配。
 
 ## 运行
 
@@ -210,6 +212,19 @@ Waiting for debugger to connect...
 本项目依赖的 QuickJS 扩展 API（在 `quickjs.h` 中声明）：
 
 所有调试 API 始终可用，无需编译时宏控制。
+
+### 调试跟踪回调签名
+
+```c
+typedef int JSDebugTraceFunc(JSContext *ctx,
+                             JSAtom filename,
+                             JSAtom funcname,
+                             int line,
+                             int col,
+                             void *opaque);
+```
+
+`filename` 与 `funcname` 为 `JSAtom` 值，仅在回调期间有效。需要字符串时通过 `JS_AtomToCString()` 转换，用完后调用 `JS_FreeCString()` 释放。匿名函数或 eval 代码时，任一字段可为 `JS_ATOM_NULL`（值为 0）。
 
 ## 注意事项
 

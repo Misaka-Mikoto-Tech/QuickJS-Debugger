@@ -59,6 +59,7 @@ jsTest/
   ┌────────▼────────┐
   │  QuickJS Engine │  Execute JS scripts, trigger debug callbacks
   │  - JS_SetDebugTraceHandler()      set/clear debug trace callback
+  │  - JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, opaque)
   │  - OP_debug opcode                fires callback at statement boundaries
   │  - JS_GetStackDepth()             get call stack depth
   │  - JS_GetLocalVariablesAtLevel()  get locals at a given frame level
@@ -120,6 +121,7 @@ make -j$(nproc)
 
 - **MSVC < 17.5**: Automatically injects the `compat/msvc/stdatomic.h` shim to resolve the missing C11 `<stdatomic.h>`.
 - **No compile-time flags required**: The debug interface uses a dedicated `OP_debug` opcode that is always emitted at statement boundaries. The runtime cost is virtually zero when no handler is set (a single `unlikely` branch). Attach a handler at any time via `JS_SetDebugTraceHandler()`. `DIRECT_DISPATCH` (computed goto) remains fully enabled.
+- **`JSDebugTraceFunc` callback signature**: `filename` and `funcname` are passed as `JSAtom` values (not `const char*`). Use `JS_AtomToCString()` / `JS_FreeCString()` inside the callback to convert them to strings when needed. This avoids a heap allocation on every instrumented statement when you only need to compare against known breakpoint atoms.
 
 ## Usage
 
@@ -208,6 +210,19 @@ In addition to VS Code, you can also debug with Chrome:
 Extended QuickJS APIs this project depends on (declared in `quickjs.h`):
 
 All debug APIs are always available — no compile-time flags required.
+
+### Debug Trace Callback
+
+```c
+typedef int JSDebugTraceFunc(JSContext *ctx,
+                             JSAtom filename,
+                             JSAtom funcname,
+                             int line,
+                             int col,
+                             void *opaque);
+```
+
+`filename` and `funcname` are `JSAtom` values, valid only for the duration of the callback. Convert with `JS_AtomToCString()` and free with `JS_FreeCString()`. Either may be `JS_ATOM_NULL` for anonymous functions or eval code.
 
 ## Notes
 

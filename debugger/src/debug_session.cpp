@@ -827,15 +827,31 @@ json::Value DebugSession::evaluate_on_call_frame(const std::string& call_frame_i
 // ============================================================
 //
 int DebugSession::debug_trace_handler(JSContext *ctx,
-                               const char *filename, const char *funcname,
+                               JSAtom filename, JSAtom funcname,
                                int line, int col,
                                void *opaque) {
 
     auto* self = static_cast<DebugSession*>(opaque);
     if (!self->enabled_.load()) return 0;
-    if (!filename || line <= 0) return 0;
+    if (line <= 0) return 0;
 
-    printf("---->[DBG] Trace: %s:%d in %s\n", filename, line, funcname ? funcname : "(anonymous)");
+    // Convert atoms to C strings (valid only for the duration of this callback)
+    const char *filename_str = JS_AtomToCString(ctx, filename);
+    const char *funcname_str = JS_AtomToCString(ctx, funcname);
+
+    // RAII guard ensures strings are freed on all return paths
+    struct Guard {
+        JSContext *ctx;
+        const char *a, *b;
+        ~Guard() {
+            if (a) JS_FreeCString(ctx, a);
+            if (b) JS_FreeCString(ctx, b);
+        }
+    } guard{ctx, filename_str, funcname_str};
+
+    if (!filename_str) return 0;
+
+    printf("---->[DBG] Trace: %s:%d in %s\n", filename_str, line, funcname_str ? funcname_str : "(anonymous)");
 
     int depth = JS_GetStackDepth(ctx);
 
@@ -844,8 +860,8 @@ int DebugSession::debug_trace_handler(JSContext *ctx,
     while ((int)self->frame_stack_.size() < depth) self->frame_stack_.push_back(FrameInfo{});
     if (!self->frame_stack_.empty()) {
         auto& top = self->frame_stack_.back();
-        top.filename = filename ? filename : "";
-        top.funcname = funcname ? funcname : "";
+        top.filename = filename_str ? filename_str : "";
+        top.funcname = funcname_str ? funcname_str : "";
         top.line = line;
         top.col = col;
     }
@@ -856,7 +872,7 @@ int DebugSession::debug_trace_handler(JSContext *ctx,
     if (self->pause_requested_.load()) {
         self->pause_requested_.store(false);
         self->step_mode_.store(StepMode::None);
-        self->do_pause(ctx, filename, funcname, line, col, PauseReason::PauseRequest, 0);
+        self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::PauseRequest, 0);
         return 0;
     }
 
@@ -864,17 +880,17 @@ int DebugSession::debug_trace_handler(JSContext *ctx,
     if (self->pause_on_start_) {
         self->pause_on_start_ = false;
         self->step_mode_.store(StepMode::None);
-        self->do_pause(ctx, filename, funcname, line, col, PauseReason::Entry, 0);
+        self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Entry, 0);
         return 0;
     }
 
     // Check breakpoints (in all modes)
-    if (self->check_breakpoint(filename, line)) {
+    if (self->check_breakpoint(filename_str, line)) {
         // Find which breakpoint
         int bp_id = 0;
         {
             std::lock_guard<std::mutex> lock(self->bp_mutex_);
-            std::string norm = normalize_url(filename);
+            std::string norm = normalize_url(filename_str);
             std::string furl = to_file_url(norm);
             std::string base = norm;
             auto p = base.rfind('/');
@@ -903,7 +919,7 @@ int DebugSession::debug_trace_handler(JSContext *ctx,
             }
         }
         self->step_mode_.store(StepMode::None);
-        self->do_pause(ctx, filename, funcname, line, col, PauseReason::Breakpoint, bp_id);
+        self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Breakpoint, bp_id);
         return 0;
     }
 
@@ -916,9 +932,9 @@ int DebugSession::debug_trace_handler(JSContext *ctx,
     case StepMode::Into:
         // Pause on the next line/statement
         if (line != self->step_start_line_ ||
-            (filename && self->step_start_file_ != filename)) {
+            (filename_str && self->step_start_file_ != filename_str)) {
             self->step_mode_.store(StepMode::None);
-            self->do_pause(ctx, filename, funcname, line, col, PauseReason::Step, 0);
+            self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Step, 0);
         }
         break;
 
@@ -926,9 +942,9 @@ int DebugSession::debug_trace_handler(JSContext *ctx,
         // Pause on next line at the same or lower depth
         if (depth <= self->step_start_depth_) {
             if (line != self->step_start_line_ ||
-                (filename && self->step_start_file_ != filename)) {
+                (filename_str && self->step_start_file_ != filename_str)) {
                 self->step_mode_.store(StepMode::None);
-                self->do_pause(ctx, filename, funcname, line, col, PauseReason::Step, 0);
+                self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Step, 0);
             }
         }
         break;
@@ -937,7 +953,7 @@ int DebugSession::debug_trace_handler(JSContext *ctx,
         // Pause when we return to a lower depth
         if (depth < self->step_start_depth_) {
             self->step_mode_.store(StepMode::None);
-            self->do_pause(ctx, filename, funcname, line, col, PauseReason::Step, 0);
+            self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Step, 0);
         }
         break;
 
