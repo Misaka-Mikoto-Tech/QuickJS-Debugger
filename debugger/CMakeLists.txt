@@ -3,23 +3,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(qjs_debug
     src/main.cpp
-    src/websocket_server.cpp
-    src/cdp_handler.cpp
-    src/debug_session.cpp
+    src/cdp/websocket_server.cpp
+    src/cdp/cdp_handler.cpp
+    src/cdp/debug_session.cpp
 )
 
 add_executable(debug_session_cycle_test
     tests/debug_session_cycle_test.cpp
-    src/debug_session.cpp
+    src/cdp/debug_session.cpp
 )
 
 target_include_directories(qjs_debug PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cdp
     ${CMAKE_SOURCE_DIR}/quickjs
 )
 
 target_include_directories(debug_session_cycle_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cdp
     ${CMAKE_SOURCE_DIR}/quickjs
 )
 

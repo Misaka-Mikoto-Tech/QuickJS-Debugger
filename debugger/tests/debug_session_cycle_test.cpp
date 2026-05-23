@@ -3,7 +3,7 @@
 #include <iostream>
 #include <string>
 
-#include "debug_session.h"
+#include "cdp/debug_session.h"
 
 namespace {
 

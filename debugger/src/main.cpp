@@ -1,6 +1,6 @@
-#include "websocket_server.h"
-#include "cdp_handler.h"
-#include "debug_session.h"
+#include "cdp/websocket_server.h"
+#include "cdp/cdp_handler.h"
+#include "cdp/debug_session.h"
 
 #include <cstdio>
 #include <cstdlib>
