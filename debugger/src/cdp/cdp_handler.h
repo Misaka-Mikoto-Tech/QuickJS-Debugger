@@ -33,6 +33,7 @@ private:
     json::Value on_debugger_set_breakpoints_active(const json::Value& params);
     json::Value on_debugger_get_possible_breakpoints(const json::Value& params);
     json::Value on_debugger_evaluate_on_call_frame(const json::Value& params);
+    json::Value on_debugger_set_variable_value(const json::Value& params);
     json::Value on_debugger_set_pause_on_exceptions(const json::Value& params);
 
     // Runtime domain

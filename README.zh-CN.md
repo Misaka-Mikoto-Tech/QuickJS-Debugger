@@ -59,7 +59,7 @@ jsTest/
   ┌────────▼────────┐
   │   QuickJS 引擎   │  执行 JS 脚本，通过调试回调触发
   │  ─ JS_SetDebugTraceHandler()     设置/清除调试跟踪回调
-  │  ─ JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, opaque)
+  │  ─ JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, flags, opaque)
   │  ─ OP_debug opcode               语句边界触发回调
   │  ─ JS_GetStackDepth()            获取调用栈深度
   │  ─ JS_GetLocalVariablesAtLevel() 获取指定层级局部变量
@@ -200,12 +200,35 @@ Waiting for debugger to connect...
 | Debugger  | `resume`                         |
 | Debugger  | `stepOver` / `stepInto` / `stepOut` |
 | Debugger  | `pause`                          |
+| Debugger  | `evaluateOnCallFrame`            |
+| Debugger  | `setVariableValue`               |
 | Debugger  | `setPauseOnExceptions`           |
 | Runtime   | `enable`                         |
 | Runtime   | `runIfWaitingForDebugger`        |
 | Runtime   | `getProperties`                  |
 | Runtime   | `evaluate`                       |
 | Profiler  | `enable` / `disable`             |
+
+发出的 CDP 事件：`Debugger.scriptParsed`、`Debugger.scriptFailedToParse`、
+`Debugger.paused`、`Debugger.resumed`、`Runtime.consoleAPICalled`、
+`Runtime.executionContextCreated`。
+
+## 调试器特性
+
+- **断点** — 支持基于 URL 或 URL 正则的行断点，可启用 / 禁用。
+- **单步** — step over / into / out，以及 pause / resume。
+- **`debugger;` 语句** — 用户代码中可达的 `debugger;` 语句无需断点即触发暂停。
+- **调用栈检视** — 完整的 JS 调用栈，含文件 / 函数 / 行号。
+- **作用域链** — 每帧除 **Local**（参数 + 局部变量）外，还会暴露一个
+  **Closure** 作用域（从外层函数捕获的闭包变量）；其值通过 `var_refs`
+  实时读取，会反映内层函数对变量的修改。
+- **`Debugger.setVariableValue`** — 在暂停状态下修改任意栈帧上的参数 /
+  局部 / 闭包变量；`const` 绑定与 TDZ 状态会返回明确错误。
+- **`Debugger.evaluateOnCallFrame`** — 在某个暂停栈帧的**词法环境**下求
+  值表达式，可直接访问该帧的参数、局部、闭包变量以及全局；底层使用
+  `JS_EvalInStackFrame()`。
+- **`Debugger.scriptParsed` / `scriptFailedToParse`** — 脚本加载与解析失败
+  （SyntaxError）时分别推送。
 
 ## QuickJS 调试 API
 
@@ -216,15 +239,76 @@ Waiting for debugger to connect...
 ### 调试跟踪回调签名
 
 ```c
+/* 传给回调 `flags` 参数的标志位 */
+#define JS_DEBUG_TRACE_DEBUGGER_STMT (1 << 0)
+
 typedef int JSDebugTraceFunc(JSContext *ctx,
                              JSAtom filename,
                              JSAtom funcname,
                              int line,
                              int col,
+                             int flags,
+                             void *opaque);
+
+void JS_SetDebugTraceHandler(JSContext *ctx,
+                             JSDebugTraceFunc *func,
                              void *opaque);
 ```
 
 `filename` 与 `funcname` 为 `JSAtom` 值，仅在回调期间有效。需要字符串时通过 `JS_AtomToCString()` 转换，用完后调用 `JS_FreeCString()` 释放。匿名函数或 eval 代码时，任一字段可为 `JS_ATOM_NULL`（值为 0）。
+
+`flags` 携带本次回调的额外语义信息。目前仅定义一个位：`JS_DEBUG_TRACE_DEBUGGER_STMT` 仅在回调由 `debugger;` 语句（编译为专用的 `OP_debugger_stmt` 操作码）触发时置位，使嵌入者无需扫描源码即可区分真正的 `debugger;` 语句与语句边界的 `OP_debug`。
+
+### 栈帧变量检视
+
+```c
+typedef struct {
+    const char *name;      // 变量名（UTF-8，由数组拥有）
+    JSValue value;         // 借用值；如需保留请 dup
+    bool is_arg;           // 是否为函数实参
+    bool is_closure;       // 是否为外层捕获的闭包变量
+    int scope_level;       // 词法作用域深度（0 = 函数顶层）
+} JSDebugLocalVar;
+
+int  JS_GetStackDepth(JSContext *ctx);
+int  JS_GetLocalVariablesAtLevel(JSContext *ctx, int level,
+                                 JSDebugLocalVar **vars_out,
+                                 int *count_out);
+void JS_FreeLocalVariables(JSContext *ctx,
+                           JSDebugLocalVar *vars, int count);
+```
+
+返回数组依次为：参数、局部变量、**外层捕获的闭包变量**
+（`is_closure == true`）。处于 TDZ 或名字以 `<` 开头的内部变量会被跳过。
+
+### 修改栈帧上的变量
+
+```c
+// 返回值：
+//    0 成功（取得 new_value 所有权），
+//   -1 帧上找不到该变量名，
+//   -2 该绑定为 `const`，
+//   -3 内部错误。
+int JS_SetVariableAtLevel(JSContext *ctx, int level,
+                          const char *name, JSValue new_value);
+```
+
+按"参数 → 局部 → 闭包"的顺序按名查找；用于实现 CDP 的
+`Debugger.setVariableValue`。
+
+### 在栈帧中求值表达式
+
+```c
+JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
+                            const char *input, size_t input_len,
+                            const char *filename);
+```
+
+把 `input` 作为表达式在 `level` 处栈帧的词法环境下求值。实现上临时将运行时的当前栈帧指向目标帧，复用引擎原有的直接 eval 管道（`JS_EVAL_TYPE_DIRECT`），因此标识符解析走与运行时 `eval(...)` 运算符完全相同的路径——可访问参数、`var` 局部变量、块作用域 `let` / `const` 以及闭包变量，还包括全局。返回结果值，或在解析 / 运行出错时返回 `JS_EXCEPTION`。用于实现 CDP 的 `Debugger.evaluateOnCallFrame`。
+
+### `debugger` 语句
+
+对 `debugger;` 语句，解析器发射专用的 `OP_debugger_stmt` 操作码（始终发射，与当前是否已挂接处理程序无关）。后挂接的 `JSDebugTraceFunc` 在这些位置会看到 `flags & JS_DEBUG_TRACE_DEBUGGER_STMT` 被置位，从而无需扫描源码即可区分真正的 `debugger;` 语句与语句边界的 `OP_debug`。CDP 调试器以 `reason: "debugCommand"` 暂停。
 
 ## 注意事项
 

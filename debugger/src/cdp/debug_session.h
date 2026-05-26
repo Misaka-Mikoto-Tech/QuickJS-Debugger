@@ -40,7 +40,8 @@ enum class PauseReason {
     Breakpoint,
     Step,
     PauseRequest,
-    Entry
+    Entry,
+    DebuggerStatement
 };
 
 class DebugSession {
@@ -85,10 +86,18 @@ public:
     json::Value evaluate_on_call_frame(const std::string& call_frame_id,
                                        const std::string& expression);
 
-    // --- QuickJS debug trace handler (OP_debug callback) ---
+    // --- Set a variable value on a stack frame (cross-thread) ---
+    // Returns CDP-style result/error JSON object.
+    json::Value set_variable_value(int scope_number,
+                                   const std::string& variable_name,
+                                   const json::Value& new_value_json,
+                                   const std::string& call_frame_id);
+
+    // --- QuickJS debug trace handler (OP_debug / OP_debugger_stmt callback) ---
     static int debug_trace_handler(JSContext *ctx,
                           JSAtom filename, JSAtom funcname,
                           int line, int col,
+                          int flags,
                           void *opaque);
 
     // --- Wait for debugger ---
@@ -168,5 +177,19 @@ private:
     std::condition_variable eval_request_cv_;  // signals JS thread: new request
     std::condition_variable eval_done_cv_;     // signals WS thread: result ready
     EvalRequest* pending_eval_ = nullptr;
+
+    // Set-variable-while-paused queue (WS thread -> JS thread)
+    struct SetVarRequest {
+        int call_frame_level = 0;
+        std::string name;
+        // Encoded value source (JavaScript expression text to evaluate on the
+        // JS thread).  Mirrors CDP `Debugger.setVariableValue` where the new
+        // value is a `CallArgument` -- we serialize it back to an expression.
+        std::string value_expr;
+        json::Value result;
+        bool ready = false;
+    };
+    SetVarRequest* pending_setvar_ = nullptr;
+
     JSContext* paused_ctx_ = nullptr;  // set during pause for eval access
 };

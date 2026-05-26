@@ -59,7 +59,7 @@ jsTest/
   ┌────────▼────────┐
   │  QuickJS Engine │  Execute JS scripts, trigger debug callbacks
   │  - JS_SetDebugTraceHandler()      set/clear debug trace callback
-  │  - JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, opaque)
+  │  - JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, flags, opaque)
   │  - OP_debug opcode                fires callback at statement boundaries
   │  - JS_GetStackDepth()             get call stack depth
   │  - JS_GetLocalVariablesAtLevel()  get locals at a given frame level
@@ -198,12 +198,39 @@ In addition to VS Code, you can also debug with Chrome:
 | Debugger  | `resume`                          |
 | Debugger  | `stepOver` / `stepInto` / `stepOut` |
 | Debugger  | `pause`                           |
+| Debugger  | `evaluateOnCallFrame`             |
+| Debugger  | `setVariableValue`                |
 | Debugger  | `setPauseOnExceptions`            |
 | Runtime   | `enable`                          |
 | Runtime   | `runIfWaitingForDebugger`         |
 | Runtime   | `getProperties`                   |
 | Runtime   | `evaluate`                        |
 | Profiler  | `enable` / `disable`              |
+
+CDP events emitted: `Debugger.scriptParsed`, `Debugger.scriptFailedToParse`,
+`Debugger.paused`, `Debugger.resumed`, `Runtime.consoleAPICalled`,
+`Runtime.executionContextCreated`.
+
+## Debugger Features
+
+- **Breakpoints** — line breakpoints by URL or by URL regex, with active/inactive toggle.
+- **Stepping** — step over / into / out, plus pause / resume.
+- **`debugger;` statement** — pauses execution at any reachable `debugger;`
+  statement in user code, regardless of breakpoints.
+- **Call stack inspection** — full JS call stack with file / function / line.
+- **Scope chain** — each frame exposes a **Local** scope (arguments and
+  locals) and a **Closure** scope (variables captured from enclosing
+  functions).  Closure variable values are read live from the underlying
+  `var_refs` and reflect mutations made through inner functions.
+- **`Debugger.setVariableValue`** — write a new value to any argument /
+  local / closure variable on any paused stack frame.  `const` bindings and
+  TDZ slots are rejected with a clear error.
+- **`Debugger.evaluateOnCallFrame`** — evaluates an expression in the
+  *context of a paused stack frame*, with access to that frame's arguments,
+  locals and closures (in addition to globals).  Powered by
+  `JS_EvalInStackFrame()`.
+- **`Debugger.scriptParsed` / `scriptFailedToParse`** — emitted when a script
+  is loaded and when it fails to parse (SyntaxError).
 
 ## QuickJS Debug API
 
@@ -214,15 +241,98 @@ All debug APIs are always available — no compile-time flags required.
 ### Debug Trace Callback
 
 ```c
+/* Flag bits passed to the callback's `flags` argument. */
+#define JS_DEBUG_TRACE_DEBUGGER_STMT (1 << 0)
+
 typedef int JSDebugTraceFunc(JSContext *ctx,
                              JSAtom filename,
                              JSAtom funcname,
                              int line,
                              int col,
+                             int flags,
+                             void *opaque);
+
+void JS_SetDebugTraceHandler(JSContext *ctx,
+                             JSDebugTraceFunc *func,
                              void *opaque);
 ```
 
-`filename` and `funcname` are `JSAtom` values, valid only for the duration of the callback. Convert with `JS_AtomToCString()` and free with `JS_FreeCString()`. Either may be `JS_ATOM_NULL` for anonymous functions or eval code.
+`filename` and `funcname` are `JSAtom` values, valid only for the duration of
+the callback. Convert with `JS_AtomToCString()` and free with
+`JS_FreeCString()`. Either may be `JS_ATOM_NULL` for anonymous functions or
+eval code.
+
+`flags` carries extra information about why the callback fired. Currently
+only one bit is defined: `JS_DEBUG_TRACE_DEBUGGER_STMT` is set when the
+callback was triggered by a `debugger;` statement (compiled as the dedicated
+`OP_debugger_stmt` opcode) as opposed to a normal statement-boundary `OP_debug`.
+
+### Stack-frame Inspection
+
+```c
+typedef struct {
+    const char *name;      // variable name (UTF-8, owned by the array)
+    JSValue value;         // borrowed value; dup if you keep it
+    bool is_arg;           // true if this is a function argument
+    bool is_closure;       // true if captured from an enclosing scope
+    int scope_level;       // lexical scope depth (0 = top of function)
+} JSDebugLocalVar;
+
+int  JS_GetStackDepth(JSContext *ctx);
+int  JS_GetLocalVariablesAtLevel(JSContext *ctx, int level,
+                                 JSDebugLocalVar **vars_out,
+                                 int *count_out);
+void JS_FreeLocalVariables(JSContext *ctx,
+                           JSDebugLocalVar *vars, int count);
+```
+
+Returned array contains, in order: arguments, then locals, then **closure
+variables** captured from enclosing functions (`is_closure == true`).
+Variables in TDZ or whose source name is internal (starts with `<`) are
+skipped.
+
+### Mutating a Variable on a Stack Frame
+
+```c
+// Returns:
+//    0 on success (takes ownership of new_value),
+//   -1 if no variable with that name on the frame,
+//   -2 if the binding is `const`,
+//   -3 on internal error.
+int JS_SetVariableAtLevel(JSContext *ctx, int level,
+                          const char *name, JSValue new_value);
+```
+
+Searches arguments first, then locals, then closures, by name.  Used to
+implement CDP's `Debugger.setVariableValue`.
+
+### Expression Evaluation in a Stack Frame
+
+```c
+JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
+                            const char *input, size_t input_len,
+                            const char *filename);
+```
+
+Evaluates `input` as an expression in the lexical environment of the stack
+frame at `level`.  Implemented by temporarily setting the runtime's current
+stack frame to the target frame and reusing the engine's direct-eval pipeline
+(`JS_EVAL_TYPE_DIRECT`), so identifiers resolve through the same path the
+`eval(...)` operator uses at runtime -- including arguments, var-declared
+locals, block-scoped `let` / `const` bindings and closure variables in
+addition to the global scope.  Returns the result value, or `JS_EXCEPTION`
+on parse / runtime error.  Used to implement CDP's
+`Debugger.evaluateOnCallFrame`.
+
+### `debugger` Statement
+
+The parser emits a dedicated `OP_debugger_stmt` opcode for `debugger;`
+statements (always, independent of whether a handler is currently
+attached).  Any `JSDebugTraceFunc` set later observes those locations with
+`flags & JS_DEBUG_TRACE_DEBUGGER_STMT` set, so the embedder can distinguish
+a real `debugger;` statement from a statement-boundary `OP_debug` without
+any source-text inspection.  The CDP debugger pauses with `reason:
+"debugCommand"`.
 
 ## Notes
 

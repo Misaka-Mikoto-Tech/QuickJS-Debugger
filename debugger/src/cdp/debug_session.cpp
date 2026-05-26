@@ -251,6 +251,67 @@ bool DebugSession::check_breakpoint(const std::string& filename, int line) const
     return false;
 }
 
+json::Value DebugSession::set_variable_value(int scope_number,
+                                             const std::string& variable_name,
+                                             const json::Value& new_value_json,
+                                             const std::string& call_frame_id) {
+    (void)scope_number; // QuickJS resolves the slot by name across the frame
+
+    if (!paused_.load()) {
+        auto err = json::Value::object();
+        auto e = json::Value::object();
+        e.set("code", -32000);
+        e.set("message", "Not paused");
+        err.set("error", e);
+        return err;
+    }
+
+    // Serialize the CDP CallArgument to a JS expression we can evaluate on the
+    // JS thread.  CDP fields: { value?, unserializableValue?, objectId? }.
+    std::string expr;
+    if (new_value_json.has("unserializableValue")) {
+        // e.g. NaN, Infinity, -0, BigInt literals
+        expr = new_value_json["unserializableValue"].get_string();
+    } else if (new_value_json.has("objectId")) {
+        // Object references from a previous CDP response are not yet supported
+        // round-tripping; reject so the client surfaces a clear error.
+        auto err = json::Value::object();
+        auto e = json::Value::object();
+        e.set("code", -32000);
+        e.set("message", "objectId references are not supported in setVariableValue");
+        err.set("error", e);
+        return err;
+    } else if (new_value_json.has("value")) {
+        // Serialize the JSON value as a JS literal.  serialize() produces a
+        // JSON literal which is also a valid JS literal for primitives /
+        // arrays / objects of primitives.
+        expr = new_value_json["value"].serialize();
+    } else {
+        expr = "undefined";
+    }
+
+    int level = 0;
+    try { level = std::stoi(call_frame_id); } catch (...) {}
+
+    // Hand the request to the JS thread.
+    SetVarRequest req;
+    req.call_frame_level = level;
+    req.name = variable_name;
+    req.value_expr = std::move(expr);
+
+    {
+        std::unique_lock<std::mutex> lk(eval_mutex_);
+        pending_setvar_ = &req;
+    }
+    pause_cv_.notify_all();
+    {
+        std::unique_lock<std::mutex> lk(eval_mutex_);
+        eval_done_cv_.wait(lk, [&] { return req.ready; });
+        pending_setvar_ = nullptr;
+    }
+    return req.result;
+}
+
 // ============================================================
 // Execution control
 // ============================================================
@@ -558,6 +619,7 @@ void DebugSession::capture_frames(JSContext* ctx, const char* filename,
         
         if (vars && var_count > 0) {
             auto local_props = json::Value::array();
+            auto closure_props = json::Value::array();
             for (int v = 0; v < var_count; v++) {
                 auto prop = json::Value::object();
                 prop.set("name", vars[v].name ? vars[v].name : "");
@@ -566,21 +628,41 @@ void DebugSession::capture_frames(JSContext* ctx, const char* filename,
                 prop.set("configurable", true);
                 prop.set("enumerable", true);
                 prop.set("isOwn", true);
-                local_props.push(prop);
+                if (vars[v].is_closure) {
+                    closure_props.push(prop);
+                } else {
+                    local_props.push(prop);
+                }
             }
             JS_FreeLocalVariables(ctx, vars, var_count);
 
-            std::string scope_oid = store_object("scope", local_props);
+            // Local scope
+            {
+                std::string scope_oid = store_object("scope", local_props);
+                auto local_scope = json::Value::object();
+                local_scope.set("type", "local");
+                auto scope_obj = json::Value::object();
+                scope_obj.set("type", "object");
+                scope_obj.set("className", "Object");
+                scope_obj.set("objectId", scope_oid);
+                local_scope.set("object", scope_obj);
+                local_scope.set("name", fi.funcname.empty() ? "(anonymous)" : fi.funcname);
+                scope_chain.push(local_scope);
+            }
 
-            auto local_scope = json::Value::object();
-            local_scope.set("type", "local");
-            auto scope_obj = json::Value::object();
-            scope_obj.set("type", "object");
-            scope_obj.set("className", "Object");
-            scope_obj.set("objectId", scope_oid);
-            local_scope.set("object", scope_obj);
-            local_scope.set("name", fi.funcname.empty() ? "(anonymous)" : fi.funcname);
-            scope_chain.push(local_scope);
+            // Closure scope (captured variables from enclosing functions)
+            if (closure_props.size() > 0) {
+                std::string scope_oid = store_object("scope", closure_props);
+                auto closure_scope = json::Value::object();
+                closure_scope.set("type", "closure");
+                auto cobj = json::Value::object();
+                cobj.set("type", "object");
+                cobj.set("className", "Object");
+                cobj.set("objectId", scope_oid);
+                closure_scope.set("object", cobj);
+                closure_scope.set("name", fi.funcname.empty() ? "(anonymous)" : fi.funcname);
+                scope_chain.push(closure_scope);
+            }
         }
 
         // Global scope
@@ -678,6 +760,11 @@ void DebugSession::do_pause(JSContext* ctx, const char* filename,
         params.set("reason", "Break on start");
         params.set("hitBreakpoints", json::Value::array());
         break;
+    case PauseReason::DebuggerStatement:
+        // CDP reason name for `debugger` keyword
+        params.set("reason", "debugCommand");
+        params.set("hitBreakpoints", json::Value::array());
+        break;
     }
 
     if (send_event_) {
@@ -692,71 +779,97 @@ void DebugSession::do_pause(JSContext* ctx, const char* filename,
         std::unique_lock<std::mutex> lock(pause_mutex_);
         while (paused_.load()) {
             pause_cv_.wait(lock, [this] {
-                return !paused_.load() || pending_eval_ != nullptr;
+                return !paused_.load()
+                    || pending_eval_ != nullptr
+                    || pending_setvar_ != nullptr;
             });
 
             // Process pending eval request if any
             if (paused_.load() && pending_eval_ != nullptr) {
                 std::lock_guard<std::mutex> eval_lock(eval_mutex_);
                 if (pending_eval_) {
-                    // Evaluate expression on the JS thread
                     int frame_level = 0;
                     try { frame_level = std::stoi(pending_eval_->call_frame_id); } catch (...) {}
 
-                    // Try local variable lookup first
-                    bool found = false;
-                    int var_count = 0;
-                    JSDebugLocalVar* vars = nullptr;
-                    int ret = JS_GetLocalVariablesAtLevel(ctx, frame_level, &vars, &var_count);
-                    if (ret < 0) {
-                        // Failed to get variables - continue with empty scope
-                        vars = nullptr;
-                        var_count = 0;
-                    }
-                    if (vars && var_count > 0) {
-                        for (int v = 0; v < var_count; v++) {
-                            if (vars[v].name && pending_eval_->expression == vars[v].name) {
-                                pending_eval_->result = json::Value::object();
-                                pending_eval_->result.set("result",
-                                    js_value_to_remote_object(ctx, vars[v].value, "watch"));
-                                found = true;
-                                break;
-                            }
-                        }
-                        JS_FreeLocalVariables(ctx, vars, var_count);
-                    }
+                    JSValue eval_val = JS_EvalInStackFrame(ctx,
+                        frame_level,
+                        pending_eval_->expression.c_str(),
+                        pending_eval_->expression.size(),
+                        "<debugger-eval>");
 
-                    if (!found) {
-                        // Try global eval as fallback
-                        JSValue global = JS_GetGlobalObject(ctx);
-                        JSValue eval_val = JS_Eval(ctx,
-                            pending_eval_->expression.c_str(),
-                            pending_eval_->expression.size(),
-                            "<debugger-eval>", JS_EVAL_TYPE_GLOBAL);
-                        if (JS_IsException(eval_val)) {
-                            JSValue exc = JS_GetException(ctx);
-                            const char* exc_str = JS_ToCString(ctx, exc);
-                            auto err_result = json::Value::object();
-                            auto err_obj = json::Value::object();
-                            err_obj.set("type", "object");
-                            err_obj.set("subtype", "error");
-                            err_obj.set("className", "Error");
-                            err_obj.set("description", exc_str ? exc_str : "Error");
-                            if (exc_str) JS_FreeCString(ctx, exc_str);
-                            JS_FreeValue(ctx, exc);
-                            err_result.set("result", err_obj);
-                            err_result.set("exceptionDetails", json::Value::object());
-                            pending_eval_->result = err_result;
-                        } else {
-                            pending_eval_->result = json::Value::object();
-                            pending_eval_->result.set("result",
-                                js_value_to_remote_object(ctx, eval_val, "console"));
-                        }
-                        JS_FreeValue(ctx, eval_val);
-                        JS_FreeValue(ctx, global);
+                    if (JS_IsException(eval_val)) {
+                        JSValue exc = JS_GetException(ctx);
+                        const char* exc_str = JS_ToCString(ctx, exc);
+                        auto err_result = json::Value::object();
+                        auto err_obj = json::Value::object();
+                        err_obj.set("type", "object");
+                        err_obj.set("subtype", "error");
+                        err_obj.set("className", "Error");
+                        err_obj.set("description", exc_str ? exc_str : "Error");
+                        if (exc_str) JS_FreeCString(ctx, exc_str);
+                        JS_FreeValue(ctx, exc);
+                        err_result.set("result", err_obj);
+                        err_result.set("exceptionDetails", json::Value::object());
+                        pending_eval_->result = err_result;
+                    } else {
+                        pending_eval_->result = json::Value::object();
+                        pending_eval_->result.set("result",
+                            js_value_to_remote_object(ctx, eval_val, "console"));
                     }
+                    JS_FreeValue(ctx, eval_val);
 
                     pending_eval_->ready = true;
+                    eval_done_cv_.notify_all();
+                }
+            }
+
+            // Process pending set-variable request if any
+            if (paused_.load() && pending_setvar_ != nullptr) {
+                std::lock_guard<std::mutex> eval_lock(eval_mutex_);
+                if (pending_setvar_) {
+                    JSValue new_val = JS_EvalInStackFrame(ctx,
+                        pending_setvar_->call_frame_level,
+                        pending_setvar_->value_expr.c_str(),
+                        pending_setvar_->value_expr.size(),
+                        "<debugger-setvar>");
+                    if (JS_IsException(new_val)) {
+                        JSValue exc = JS_GetException(ctx);
+                        const char* exc_str = JS_ToCString(ctx, exc);
+                        auto err = json::Value::object();
+                        err.set("code", -32000);
+                        err.set("message",
+                            exc_str ? std::string("Failed to evaluate new value: ") + exc_str
+                                    : std::string("Failed to evaluate new value"));
+                        if (exc_str) JS_FreeCString(ctx, exc_str);
+                        JS_FreeValue(ctx, exc);
+                        auto wrap = json::Value::object();
+                        wrap.set("error", err);
+                        pending_setvar_->result = wrap;
+                    } else {
+                        int rc = JS_SetVariableAtLevel(ctx,
+                            pending_setvar_->call_frame_level,
+                            pending_setvar_->name.c_str(),
+                            new_val);
+                        // JS_SetVariableAtLevel takes ownership of `new_val`.
+                        if (rc == 0) {
+                            pending_setvar_->result = json::Value::object();
+                        } else {
+                            auto err = json::Value::object();
+                            err.set("code", -32000);
+                            if (rc == -1)
+                                err.set("message",
+                                    std::string("Variable '") + pending_setvar_->name + "' not found");
+                            else if (rc == -2)
+                                err.set("message",
+                                    std::string("Variable '") + pending_setvar_->name + "' is const");
+                            else
+                                err.set("message", std::string("Failed to set variable"));
+                            auto wrap = json::Value::object();
+                            wrap.set("error", err);
+                            pending_setvar_->result = wrap;
+                        }
+                    }
+                    pending_setvar_->ready = true;
                     eval_done_cv_.notify_all();
                 }
             }
@@ -829,6 +942,7 @@ json::Value DebugSession::evaluate_on_call_frame(const std::string& call_frame_i
 int DebugSession::debug_trace_handler(JSContext *ctx,
                                JSAtom filename, JSAtom funcname,
                                int line, int col,
+                               int flags,
                                void *opaque) {
 
     auto* self = static_cast<DebugSession*>(opaque);
@@ -959,6 +1073,15 @@ int DebugSession::debug_trace_handler(JSContext *ctx,
 
     default:
         break;
+    }
+
+    // `debugger` statement: the parser emits a dedicated OP_debugger_stmt
+    // opcode, so the runtime can flag it explicitly via JS_DEBUG_TRACE_DEBUGGER_STMT.
+    if (flags & JS_DEBUG_TRACE_DEBUGGER_STMT) {
+        self->step_mode_.store(StepMode::None);
+        self->do_pause(ctx, filename_str, funcname_str, line, col,
+                       PauseReason::DebuggerStatement, 0);
+        return 0;
     }
 
     return 0;

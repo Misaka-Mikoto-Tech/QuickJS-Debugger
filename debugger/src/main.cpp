@@ -316,6 +316,47 @@ int main(int argc, char* argv[]) {
 
     if (JS_IsException(result)) {
         JSValue exc = JS_GetException(ctx);
+
+        // Detect SyntaxError -> emit Debugger.scriptFailedToParse so DevTools
+        // can surface the failure as a parse error rather than a runtime one.
+        bool is_syntax_error = false;
+        if (JS_IsObject(exc)) {
+            JSValue name = JS_GetPropertyStr(ctx, exc, "name");
+            const char* name_str = JS_ToCString(ctx, name);
+            if (name_str && std::strcmp(name_str, "SyntaxError") == 0) {
+                is_syntax_error = true;
+            }
+            if (name_str) JS_FreeCString(ctx, name_str);
+            JS_FreeValue(ctx, name);
+        }
+        if (is_syntax_error && g_cdp) {
+            JSValue msg = JS_GetPropertyStr(ctx, exc, "message");
+            const char* msg_str = JS_ToCString(ctx, msg);
+            auto params = json::Value::object();
+            params.set("scriptId", "0");
+            params.set("url", DebugSession::to_file_url(script_file));
+            params.set("startLine", 0);
+            params.set("startColumn", 0);
+            int newline_count = 0;
+            for (char c : source) if (c == '\n') newline_count++;
+            params.set("endLine", newline_count);
+            params.set("endColumn", 0);
+            params.set("executionContextId", 1);
+            params.set("hash", "");
+            params.set("sourceMapURL", "");
+            params.set("hasSourceURL", false);
+            params.set("isModule", false);
+            params.set("length", (int)source.size());
+            if (msg_str) {
+                auto details = json::Value::object();
+                details.set("text", std::string("SyntaxError: ") + msg_str);
+                params.set("exceptionDetails", details);
+                JS_FreeCString(ctx, msg_str);
+            }
+            JS_FreeValue(ctx, msg);
+            g_cdp->send_event("Debugger.scriptFailedToParse", params);
+        }
+
         const char* str = JS_ToCString(ctx, exc);
         if (str) {
             fprintf(stderr, "[Engine] Exception: %s\n", str);

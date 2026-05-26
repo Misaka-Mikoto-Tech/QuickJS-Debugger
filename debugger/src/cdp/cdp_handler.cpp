@@ -68,6 +68,8 @@ void CDPHandler::handle_message(const std::string& message) {
         result = on_debugger_get_possible_breakpoints(params);
     } else if (method == "Debugger.evaluateOnCallFrame") {
         result = on_debugger_evaluate_on_call_frame(params);
+    } else if (method == "Debugger.setVariableValue") {
+        result = on_debugger_set_variable_value(params);
     } else if (method == "Debugger.setPauseOnExceptions") {
         result = on_debugger_set_pause_on_exceptions(params);
     }
@@ -247,6 +249,16 @@ json::Value CDPHandler::on_debugger_evaluate_on_call_frame(const json::Value& pa
     std::string call_frame_id = params.has("callFrameId") ? params["callFrameId"].get_string() : "0";
     std::string expression = params.has("expression") ? params["expression"].get_string() : "";
     return session_.evaluate_on_call_frame(call_frame_id, expression);
+}
+
+json::Value CDPHandler::on_debugger_set_variable_value(const json::Value& params) {
+    int scope_number = params.has("scopeNumber") ? params["scopeNumber"].get_int() : 0;
+    std::string variable_name =
+        params.has("variableName") ? params["variableName"].get_string() : "";
+    std::string call_frame_id =
+        params.has("callFrameId") ? params["callFrameId"].get_string() : "0";
+    json::Value new_value = params.has("newValue") ? params["newValue"] : json::Value::object();
+    return session_.set_variable_value(scope_number, variable_name, new_value, call_frame_id);
 }
 
 json::Value CDPHandler::on_debugger_set_pause_on_exceptions(const json::Value& /*params*/) {
