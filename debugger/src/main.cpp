@@ -309,74 +309,83 @@ int main(int argc, char* argv[]) {
         session.wait_for_debugger();
     }
 
-    // Evaluate the script
-    fprintf(stderr, "[Engine] Executing %s ...\n", script_file.c_str());
-    JSValue result = JS_Eval(ctx, source.c_str(), source.size(),
-                              script_file.c_str(), JS_EVAL_TYPE_GLOBAL);
-
-    if (JS_IsException(result)) {
-        JSValue exc = JS_GetException(ctx);
-
-        // Detect SyntaxError -> emit Debugger.scriptFailedToParse so DevTools
-        // can surface the failure as a parse error rather than a runtime one.
-        bool is_syntax_error = false;
-        if (JS_IsObject(exc)) {
-            JSValue name = JS_GetPropertyStr(ctx, exc, "name");
-            const char* name_str = JS_ToCString(ctx, name);
-            if (name_str && std::strcmp(name_str, "SyntaxError") == 0) {
-                is_syntax_error = true;
-            }
-            if (name_str) JS_FreeCString(ctx, name_str);
-            JS_FreeValue(ctx, name);
-        }
-        if (is_syntax_error && g_cdp) {
-            JSValue msg = JS_GetPropertyStr(ctx, exc, "message");
-            const char* msg_str = JS_ToCString(ctx, msg);
-            auto params = json::Value::object();
-            params.set("scriptId", "0");
-            params.set("url", DebugSession::to_file_url(script_file));
-            params.set("startLine", 0);
-            params.set("startColumn", 0);
-            int newline_count = 0;
-            for (char c : source) if (c == '\n') newline_count++;
-            params.set("endLine", newline_count);
-            params.set("endColumn", 0);
-            params.set("executionContextId", 1);
-            params.set("hash", "");
-            params.set("sourceMapURL", "");
-            params.set("hasSourceURL", false);
-            params.set("isModule", false);
-            params.set("length", (int)source.size());
-            if (msg_str) {
-                auto details = json::Value::object();
-                details.set("text", std::string("SyntaxError: ") + msg_str);
-                params.set("exceptionDetails", details);
-                JS_FreeCString(ctx, msg_str);
-            }
-            JS_FreeValue(ctx, msg);
-            g_cdp->send_event("Debugger.scriptFailedToParse", params);
-        }
-
-        const char* str = JS_ToCString(ctx, exc);
-        if (str) {
-            fprintf(stderr, "[Engine] Exception: %s\n", str);
-            JS_FreeCString(ctx, str);
-        }
-        // Print stack trace if available
-        if (JS_IsObject(exc)) {
-            JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
-            if (!JS_IsUndefined(stack)) {
-                const char* stack_str = JS_ToCString(ctx, stack);
-                if (stack_str) {
-                    fprintf(stderr, "%s\n", stack_str);
-                    JS_FreeCString(ctx, stack_str);
+    // Pre-flight: compile-only syntax check so DevTools receives
+    // Debugger.scriptFailedToParse *before* execution begins.
+    bool syntax_ok = true;
+    {
+        JSValue compiled = JS_Eval(ctx, source.c_str(), source.size(),
+                                   script_file.c_str(),
+                                   JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(compiled)) {
+            syntax_ok = false;
+            JSValue exc = JS_GetException(ctx);
+            if (g_cdp) {
+                JSValue msg_val = JS_GetPropertyStr(ctx, exc, "message");
+                const char* msg_str = JS_ToCString(ctx, msg_val);
+                auto params = json::Value::object();
+                params.set("scriptId", script_id);
+                params.set("url", DebugSession::to_file_url(script_file));
+                params.set("startLine", 0);
+                params.set("startColumn", 0);
+                int newline_count = 0;
+                for (char c : source) if (c == '\n') newline_count++;
+                params.set("endLine", newline_count);
+                params.set("endColumn", 0);
+                params.set("executionContextId", 1);
+                params.set("hash", "");
+                params.set("sourceMapURL", "");
+                params.set("hasSourceURL", false);
+                params.set("isModule", false);
+                params.set("length", (int)source.size());
+                if (msg_str) {
+                    auto details = json::Value::object();
+                    details.set("text", std::string("SyntaxError: ") + msg_str);
+                    params.set("exceptionDetails", details);
+                    JS_FreeCString(ctx, msg_str);
                 }
+                JS_FreeValue(ctx, msg_val);
+                g_cdp->send_event("Debugger.scriptFailedToParse", params);
             }
-            JS_FreeValue(ctx, stack);
+            const char* err_str = JS_ToCString(ctx, exc);
+            if (err_str) {
+                fprintf(stderr, "[Engine] SyntaxError: %s\n", err_str);
+                JS_FreeCString(ctx, err_str);
+            }
+            JS_FreeValue(ctx, exc);
+        } else {
+            JS_FreeValue(ctx, compiled);
         }
-        JS_FreeValue(ctx, exc);
     }
-    JS_FreeValue(ctx, result);
+
+    // Evaluate the script (skipped if syntax error was detected above)
+    if (syntax_ok) {
+        fprintf(stderr, "[Engine] Executing %s ...\n", script_file.c_str());
+        JSValue result = JS_Eval(ctx, source.c_str(), source.size(),
+                                  script_file.c_str(), JS_EVAL_TYPE_GLOBAL);
+
+        if (JS_IsException(result)) {
+            JSValue exc = JS_GetException(ctx);
+            const char* str = JS_ToCString(ctx, exc);
+            if (str) {
+                fprintf(stderr, "[Engine] Exception: %s\n", str);
+                JS_FreeCString(ctx, str);
+            }
+            // Print stack trace if available
+            if (JS_IsObject(exc)) {
+                JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+                if (!JS_IsUndefined(stack)) {
+                    const char* stack_str = JS_ToCString(ctx, stack);
+                    if (stack_str) {
+                        fprintf(stderr, "%s\n", stack_str);
+                        JS_FreeCString(ctx, stack_str);
+                    }
+                }
+                JS_FreeValue(ctx, stack);
+            }
+            JS_FreeValue(ctx, exc);
+        }
+        JS_FreeValue(ctx, result);
+    }
 
     fprintf(stderr, "[Engine] Script execution finished.\n");
 
