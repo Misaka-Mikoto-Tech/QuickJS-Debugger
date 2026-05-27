@@ -6,122 +6,51 @@ A QuickJS script debugger based on the Chrome DevTools Protocol (CDP), enabling 
 
 ![Debug in VSCode](doc/images/debugInVSCode.png)
 
-## Project Structure
+## Debugger Features
 
-```
-jsTest/
-├── CMakeLists.txt              # Top-level build file
-├── README.md
-├── test.js                     # Test script
-├── quickjs/                    # QuickJS engine (modified, with debug API)
-│   ├── quickjs.h/c             #   Core engine
-│   └── ...
-├── debugger/                   # CDP debugger
-│   ├── CMakeLists.txt          #   Debugger build file
-│   └── src/
-│       ├── main.cpp            #   Entry: creates QuickJS runtime + starts debug service
-│       ├── websocket_server.h/cpp  # WebSocket server (port 9229)
-│       ├── cdp_handler.h/cpp   #   CDP message dispatch & handling
-│       ├── debug_session.h/cpp #   Debug core: breakpoints, stepping, pause, variable capture
-│       ├── json.h              #   Lightweight JSON parse/serialize
-│       └── platform.h          #   Cross-platform socket abstraction
-├── compat/
-│   └── msvc/
-│       └── stdatomic.h         # C11 stdatomic shim for MSVC < 17.5
-└── .vscode/
-    └── launch.json             # VS Code debug attach configuration
-```
+- **Breakpoints** — line breakpoints by URL or by URL regex, with active/inactive toggle.
+- **Stepping** — step over / into / out, plus pause / resume.
+- **`debugger;` statement** — pauses execution at any reachable `debugger;`
+  statement in user code, regardless of breakpoints.
+- **Call stack inspection** — full JS call stack with file / function / line.
+- **Scope chain** — each frame exposes a **Local** scope (arguments and
+  locals) and a **Closure** scope (variables captured from enclosing
+  functions).  Closure variable values are read live from the underlying
+  `var_refs` and reflect mutations made through inner functions.
+- **`Debugger.setVariableValue`** — write a new value to any argument /
+  local / closure variable on any paused stack frame.  `const` bindings and
+  TDZ slots are rejected with a clear error.
+- **`Debugger.evaluateOnCallFrame`** — evaluates an expression in the
+  *context of a paused stack frame*, with access to that frame's arguments,
+  locals and closures (in addition to globals).  Powered by
+  `JS_EvalInStackFrame()`.
+- **`Debugger.scriptParsed` / `scriptFailedToParse`** — emitted when a script
+  is loaded and when it fails to parse (SyntaxError).
 
-## Architecture Overview
+## Supported CDP Commands
 
-```
-  VS Code (DevTools Frontend)
-       │
-       │  WebSocket (ws://127.0.0.1:9229/debug)
-       ▼
-  ┌─────────────────┐
-  │ WebSocketServer │  Accept connections, WebSocket handshake, frame encode/decode
-  └────────┬────────┘
-           │
-  ┌────────▼────────┐
-  │   CDPHandler    │  Parse CDP JSON messages, dispatch to domain handlers
-  └────────┬────────┘
-           │
-  ┌────────▼────────┐
-  │  DebugSession   │  Core debug logic
-  │  - Breakpoints  │  set/remove breakpoint
-  │  - Stepping     │  step over / into / out / continue
-  │  - Pause/Resume │  pause / resume
-  │  - Call Stack   │  capture call frames + scope variables
-  │  - debug_trace  │  OP_debug callback (check breakpoint/step)
-  └────────┬────────┘
-           │
-  ┌────────▼────────┐
-  │  QuickJS Engine │  Execute JS scripts, trigger debug callbacks
-  │  - JS_SetDebugTraceHandler()      set/clear debug trace callback
-  │  - JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, flags, opaque)
-  │  - OP_debug opcode                fires callback at statement boundaries
-  │  - JS_GetStackDepth()             get call stack depth
-  │  - JS_GetLocalVariablesAtLevel()  get locals at a given frame level
-  │  - JS_FreeLocalVariables()        free variable array
-  └─────────────────┘
-```
+| Domain    | Methods                           |
+|-----------|-----------------------------------|
+| Debugger  | `enable` / `disable`              |
+| Debugger  | `setBreakpointByUrl`              |
+| Debugger  | `removeBreakpoint`                |
+| Debugger  | `setBreakpointsActive`            |
+| Debugger  | `getScriptSource`                 |
+| Debugger  | `resume`                          |
+| Debugger  | `stepOver` / `stepInto` / `stepOut` |
+| Debugger  | `pause`                           |
+| Debugger  | `evaluateOnCallFrame`             |
+| Debugger  | `setVariableValue`                |
+| Debugger  | `setPauseOnExceptions`            |
+| Runtime   | `enable`                          |
+| Runtime   | `runIfWaitingForDebugger`         |
+| Runtime   | `getProperties`                   |
+| Runtime   | `evaluate`                        |
+| Profiler  | `enable` / `disable`              |
 
-### Debug Flow
-
-1. `qjs_debug` starts → loads script → starts WebSocket server on port 9229, waits for debugger connection
-2. VS Code connects to `ws://127.0.0.1:9229/debug` via the attach configuration in `launch.json`
-3. VS Code sends CDP commands such as `Debugger.enable` and `Debugger.setBreakpointByUrl`
-4. `CDPHandler` parses messages and calls `DebugSession` to set breakpoints
-5. `Runtime.runIfWaitingForDebugger` unblocks execution, script starts running
-6. QuickJS hits `OP_debug` opcodes at statement boundaries → invokes the debug break callback → checks breakpoint/step conditions
-7. When a breakpoint is hit, `do_pause()` captures the call stack and variables, sends a `Debugger.paused` event, and blocks
-8. VS Code receives the paused event and displays the breakpoint location and variables; user actions (continue/step) send corresponding CDP commands
-9. `DebugSession` receives the command and unblocks, script resumes execution
-
-## Building
-
-### Requirements
-
-| Platform | Compiler                      | Other       |
-|----------|-------------------------------|-------------|
-| Windows  | MSVC (VS2019+) or MinGW-w64  | CMake ≥ 3.10 |
-| Linux    | GCC or Clang                  | CMake ≥ 3.10 |
-
-### Windows (MSVC)
-
-Open a **Developer Command Prompt for VS** (or initialize the environment manually), then:
-
-```cmd
-mkdir build
-cd build
-cmake .. -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Debug
-nmake
-```
-
-The output binary is `build/debugger/qjs_debug.exe`.
-
-### Windows (MinGW)
-
-```bash
-mkdir build && cd build
-cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Debug
-mingw32-make
-```
-
-### Linux
-
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j$(nproc)
-```
-
-### Key Build Notes
-
-- **MSVC < 17.5**: Automatically injects the `compat/msvc/stdatomic.h` shim to resolve the missing C11 `<stdatomic.h>`.
-- **No compile-time flags required**: The debug interface uses a dedicated `OP_debug` opcode that is always emitted at statement boundaries. The runtime cost is virtually zero when no handler is set (a single `unlikely` branch). Attach a handler at any time via `JS_SetDebugTraceHandler()`. `DIRECT_DISPATCH` (computed goto) remains fully enabled.
-- **`JSDebugTraceFunc` callback signature**: `filename` and `funcname` are passed as `JSAtom` values (not `const char*`). Use `JS_AtomToCString()` / `JS_FreeCString()` inside the callback to convert them to strings when needed. This avoids a heap allocation on every instrumented statement when you only need to compare against known breakpoint atoms.
+CDP events emitted: `Debugger.scriptParsed`, `Debugger.scriptFailedToParse`,
+`Debugger.paused`, `Debugger.resumed`, `Runtime.consoleAPICalled`,
+`Runtime.executionContextCreated`.
 
 ## Usage
 
@@ -186,51 +115,96 @@ In addition to VS Code, you can also debug with Chrome:
 2. Open Chrome and navigate to `chrome://inspect`
 3. Find the target under "Remote Target" and click "inspect"
 
-## Supported CDP Commands
+## Building
 
-| Domain    | Methods                           |
-|-----------|-----------------------------------|
-| Debugger  | `enable` / `disable`              |
-| Debugger  | `setBreakpointByUrl`              |
-| Debugger  | `removeBreakpoint`                |
-| Debugger  | `setBreakpointsActive`            |
-| Debugger  | `getScriptSource`                 |
-| Debugger  | `resume`                          |
-| Debugger  | `stepOver` / `stepInto` / `stepOut` |
-| Debugger  | `pause`                           |
-| Debugger  | `evaluateOnCallFrame`             |
-| Debugger  | `setVariableValue`                |
-| Debugger  | `setPauseOnExceptions`            |
-| Runtime   | `enable`                          |
-| Runtime   | `runIfWaitingForDebugger`         |
-| Runtime   | `getProperties`                   |
-| Runtime   | `evaluate`                        |
-| Profiler  | `enable` / `disable`              |
+### Requirements
 
-CDP events emitted: `Debugger.scriptParsed`, `Debugger.scriptFailedToParse`,
-`Debugger.paused`, `Debugger.resumed`, `Runtime.consoleAPICalled`,
-`Runtime.executionContextCreated`.
+| Platform | Compiler                      | Other       |
+|----------|-------------------------------|-------------|
+| Windows  | MSVC (VS2019+) or MinGW-w64  | CMake ≥ 3.10 |
+| Linux    | GCC or Clang                  | CMake ≥ 3.10 |
 
-## Debugger Features
+### Windows (MSVC)
 
-- **Breakpoints** — line breakpoints by URL or by URL regex, with active/inactive toggle.
-- **Stepping** — step over / into / out, plus pause / resume.
-- **`debugger;` statement** — pauses execution at any reachable `debugger;`
-  statement in user code, regardless of breakpoints.
-- **Call stack inspection** — full JS call stack with file / function / line.
-- **Scope chain** — each frame exposes a **Local** scope (arguments and
-  locals) and a **Closure** scope (variables captured from enclosing
-  functions).  Closure variable values are read live from the underlying
-  `var_refs` and reflect mutations made through inner functions.
-- **`Debugger.setVariableValue`** — write a new value to any argument /
-  local / closure variable on any paused stack frame.  `const` bindings and
-  TDZ slots are rejected with a clear error.
-- **`Debugger.evaluateOnCallFrame`** — evaluates an expression in the
-  *context of a paused stack frame*, with access to that frame's arguments,
-  locals and closures (in addition to globals).  Powered by
-  `JS_EvalInStackFrame()`.
-- **`Debugger.scriptParsed` / `scriptFailedToParse`** — emitted when a script
-  is loaded and when it fails to parse (SyntaxError).
+Open a **Developer Command Prompt for VS** (or initialize the environment manually), then:
+
+```cmd
+mkdir build
+cd build
+cmake .. -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Debug
+nmake
+```
+
+The output binary is `build/debugger/qjs_debug.exe`.
+
+### Windows (MinGW)
+
+```bash
+mkdir build && cd build
+cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Debug
+mingw32-make
+```
+
+### Linux
+
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+make -j$(nproc)
+```
+
+### Key Build Notes
+
+- **MSVC < 17.5**: Automatically injects the `compat/msvc/stdatomic.h` shim to resolve the missing C11 `<stdatomic.h>`.
+- **No compile-time flags required**: The debug interface uses a dedicated `OP_debug` opcode that is always emitted at statement boundaries. The runtime cost is virtually zero when no handler is set (a single `unlikely` branch). Attach a handler at any time via `JS_SetDebugTraceHandler()`. `DIRECT_DISPATCH` (computed goto) remains fully enabled.
+- **`JSDebugTraceFunc` callback signature**: `filename` and `funcname` are passed as `JSAtom` values (not `const char*`). Use `JS_AtomToCString()` / `JS_FreeCString()` inside the callback to convert them to strings when needed. This avoids a heap allocation on every instrumented statement when you only need to compare against known breakpoint atoms.
+
+## Architecture Overview
+
+```
+  VS Code (DevTools Frontend)
+       │
+       │  WebSocket (ws://127.0.0.1:9229/debug)
+       ▼
+  ┌─────────────────┐
+  │ WebSocketServer │  Accept connections, WebSocket handshake, frame encode/decode
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │   CDPHandler    │  Parse CDP JSON messages, dispatch to domain handlers
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │  DebugSession   │  Core debug logic
+  │  - Breakpoints  │  set/remove breakpoint
+  │  - Stepping     │  step over / into / out / continue
+  │  - Pause/Resume │  pause / resume
+  │  - Call Stack   │  capture call frames + scope variables
+  │  - debug_trace  │  OP_debug callback (check breakpoint/step)
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │  QuickJS Engine │  Execute JS scripts, trigger debug callbacks
+  │  - JS_SetDebugTraceHandler()      set/clear debug trace callback
+  │  - JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, flags, opaque)
+  │  - OP_debug opcode                fires callback at statement boundaries
+  │  - JS_GetStackDepth()             get call stack depth
+  │  - JS_GetLocalVariablesAtLevel()  get locals at a given frame level
+  │  - JS_FreeLocalVariables()        free variable array
+  └─────────────────┘
+```
+
+### Debug Flow
+
+1. `qjs_debug` starts → loads script → starts WebSocket server on port 9229, waits for debugger connection
+2. VS Code connects to `ws://127.0.0.1:9229/debug` via the attach configuration in `launch.json`
+3. VS Code sends CDP commands such as `Debugger.enable` and `Debugger.setBreakpointByUrl`
+4. `CDPHandler` parses messages and calls `DebugSession` to set breakpoints
+5. `Runtime.runIfWaitingForDebugger` unblocks execution, script starts running
+6. QuickJS hits `OP_debug` opcodes at statement boundaries → invokes the debug break callback → checks breakpoint/step conditions
+7. When a breakpoint is hit, `do_pause()` captures the call stack and variables, sends a `Debugger.paused` event, and blocks
+8. VS Code receives the paused event and displays the breakpoint location and variables; user actions (continue/step) send corresponding CDP commands
+9. `DebugSession` receives the command and unblocks, script resumes execution
 
 ## QuickJS Debug API
 

@@ -6,124 +6,47 @@
 
 ![Debug in VSCode](doc/images/debugInVSCode.png)
 
-## 项目结构
+## 调试器特性
 
-```
-jsTest/
-├── CMakeLists.txt              # 顶层构建文件
-├── README.md
-├── test.js                     # 测试脚本
-├── quickjs/                    # QuickJS 引擎（已修改，含调试 API）
-│   ├── quickjs.h/c             #   核心引擎
-│   └── ...
-├── debugger/                   # CDP 调试器
-│   ├── CMakeLists.txt          #   调试器构建文件
-│   └── src/
-│       ├── main.cpp            #   入口：创建 QuickJS 运行时 + 启动调试服务
-│       ├── websocket_server.h/cpp  # WebSocket 服务器（端口 9229）
-│       ├── cdp_handler.h/cpp   #   CDP 协议消息分发与处理
-│       ├── debug_session.h/cpp #   调试核心：断点、单步、暂停、变量捕获
-│       ├── json.h              #   轻量 JSON 解析/序列化
-│       └── platform.h          #   跨平台 Socket 抽象
-├── compat/
-│   └── msvc/
-│       └── stdatomic.h         # MSVC < 17.5 的 C11 stdatomic 兼容垫片
-└── .vscode/
-    └── launch.json             # VS Code 调试 attach 配置
-```
+- **断点** — 支持基于 URL 或 URL 正则的行断点，可启用 / 禁用。
+- **单步** — step over / into / out，以及 pause / resume。
+- **`debugger;` 语句** — 用户代码中可达的 `debugger;` 语句无需断点即触发暂停。
+- **调用栈检视** — 完整的 JS 调用栈，含文件 / 函数 / 行号。
+- **作用域链** — 每帧除 **Local**（参数 + 局部变量）外，还会暴露一个
+  **Closure** 作用域（从外层函数捕获的闭包变量）；其值通过 `var_refs`
+  实时读取，会反映内层函数对变量的修改。
+- **`Debugger.setVariableValue`** — 在暂停状态下修改任意栈帧上的参数 /
+  局部 / 闭包变量；`const` 绑定与 TDZ 状态会返回明确错误。
+- **`Debugger.evaluateOnCallFrame`** — 在某个暂停栈帧的**词法环境**下求
+  值表达式，可直接访问该帧的参数、局部、闭包变量以及全局；底层使用
+  `JS_EvalInStackFrame()`。
+- **`Debugger.scriptParsed` / `scriptFailedToParse`** — 脚本加载与解析失败
+  （SyntaxError）时分别推送。
 
-## 架构概览
+## 支持的 CDP 命令
 
-```
-  VS Code (DevTools 前端)
-       │
-       │  WebSocket (ws://127.0.0.1:9229/debug)
-       ▼
-  ┌─────────────────┐
-  │ WebSocketServer │  接受连接、WebSocket 握手、帧编解码
-  └────────┬────────┘
-           │
-  ┌────────▼────────┐
-  │   CDPHandler    │  解析 CDP JSON 消息，分发到对应 domain 处理
-  └────────┬────────┘
-           │
-  ┌────────▼────────┐
-  │  DebugSession   │  调试核心逻辑
-  │  ─ 断点管理      │  set/remove breakpoint
-  │  ─ 单步控制      │  step over / into / out / continue
-  │  ─ 暂停/恢复     │  pause / resume
-  │  ─ 调用栈捕获    │  capture call frames + scope variables
-  │  ─ debug_trace   │  OP_debug 回调（检查断点/单步）
-  └────────┬────────┘
-           │
-  ┌────────▼────────┐
-  │   QuickJS 引擎   │  执行 JS 脚本，通过调试回调触发
-  │  ─ JS_SetDebugTraceHandler()     设置/清除调试跟踪回调
-  │  ─ JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, flags, opaque)
-  │  ─ OP_debug opcode               语句边界触发回调
-  │  ─ JS_GetStackDepth()            获取调用栈深度
-  │  ─ JS_GetLocalVariablesAtLevel() 获取指定层级局部变量
-  │  ─ JS_FreeLocalVariables()       释放变量数组
-  └─────────────────┘
-```
+| Domain    | 方法                              |
+|-----------|----------------------------------|
+| Debugger  | `enable` / `disable`             |
+| Debugger  | `setBreakpointByUrl`             |
+| Debugger  | `removeBreakpoint`               |
+| Debugger  | `setBreakpointsActive`           |
+| Debugger  | `getScriptSource`                |
+| Debugger  | `resume`                         |
+| Debugger  | `stepOver` / `stepInto` / `stepOut` |
+| Debugger  | `pause`                          |
+| Debugger  | `evaluateOnCallFrame`            |
+| Debugger  | `setVariableValue`               |
+| Debugger  | `setPauseOnExceptions`           |
+| Runtime   | `enable`                         |
+| Runtime   | `runIfWaitingForDebugger`        |
+| Runtime   | `getProperties`                  |
+| Runtime   | `evaluate`                       |
+| Profiler  | `enable` / `disable`             |
 
-### 调试流程
-
-1. `qjs_debug` 启动 → 加载脚本 → 在端口 9229 启动 WebSocket 服务，等待调试器连接
-2. VS Code 通过 `launch.json` 的 attach 配置连接到 `ws://127.0.0.1:9229/debug`
-3. VS Code 发送 `Debugger.enable`、`Debugger.setBreakpointByUrl` 等 CDP 命令
-4. `CDPHandler` 解析消息并调用 `DebugSession` 设置断点
-5. `Runtime.runIfWaitingForDebugger` 解除阻塞，开始执行脚本
-6. QuickJS 在语句边界触发 `OP_debug` 操作码 → 调用调试回调 → 检查断点/单步条件
-7. 命中断点时 `do_pause()` 捕获调用栈和变量，发送 `Debugger.paused` 事件，阻塞等待
-8. VS Code 收到暂停事件后显示断点位置和变量；用户操作 continue/step 发送对应 CDP 命令
-9. `DebugSession` 收到命令后解除阻塞，脚本继续执行
-
-## 编译
-
-### 环境要求
-
-| 平台    | 编译器                         | 其它        |
-|---------|-------------------------------|------------|
-| Windows | MSVC (VS2019+) 或 MinGW-w64   | CMake ≥ 3.10 |
-| Linux   | GCC 或 Clang                   | CMake ≥ 3.10 |
-
-### Windows (MSVC)
-
-```powershell
-# 1. 打开 VS 开发者命令行（或手动初始化环境）
-& "D:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
-
-# 2. 配置 + 编译
-mkdir build
-cd build
-cmake .. -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Debug
-nmake
-```
-
-编译产物在 `build/debugger/qjs_debug.exe`。
-
-### Windows (MinGW)
-
-```bash
-mkdir build && cd build
-cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Debug
-mingw32-make
-```
-
-### Linux
-
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j$(nproc)
-```
-
-### 关键构建选项说明
-
-- **MSVC < 17.5**：自动注入 `compat/msvc/stdatomic.h` 垫片解决缺失 C11 `<stdatomic.h>` 的问题
-- **无需编译时宏**：调试接口使用专用的 `OP_debug` 操作码，始终在语句边界发射。未设置处理程序时运行时开销几乎为零（仅一次 `unlikely` 分支判断）。可随时通过 `JS_SetDebugTraceHandler()` 挂载处理程序。`DIRECT_DISPATCH`（computed goto）保持完全启用。
-- **`JSDebugTraceFunc` 回调签名**：`filename` 和 `funcname` 现在以 `JSAtom` 形式传入（而非 `const char*`）。在回调内部通过 `JS_AtomToCString()` / `JS_FreeCString()` 按需转换为字符串。若仅需与已知断点位置比较，可直接对比 atom 值，无需堆分配。
+发出的 CDP 事件：`Debugger.scriptParsed`、`Debugger.scriptFailedToParse`、
+`Debugger.paused`、`Debugger.resumed`、`Runtime.consoleAPICalled`、
+`Runtime.executionContextCreated`。
 
 ## 运行
 
@@ -188,47 +111,98 @@ Waiting for debugger to connect...
 2. 打开 Chrome 浏览器，访问 `chrome://inspect`
 3. 在 "Remote Target" 中找到并点击 "inspect"
 
-## 支持的 CDP 命令
+## 编译
 
-| Domain    | 方法                              |
-|-----------|----------------------------------|
-| Debugger  | `enable` / `disable`             |
-| Debugger  | `setBreakpointByUrl`             |
-| Debugger  | `removeBreakpoint`               |
-| Debugger  | `setBreakpointsActive`           |
-| Debugger  | `getScriptSource`                |
-| Debugger  | `resume`                         |
-| Debugger  | `stepOver` / `stepInto` / `stepOut` |
-| Debugger  | `pause`                          |
-| Debugger  | `evaluateOnCallFrame`            |
-| Debugger  | `setVariableValue`               |
-| Debugger  | `setPauseOnExceptions`           |
-| Runtime   | `enable`                         |
-| Runtime   | `runIfWaitingForDebugger`        |
-| Runtime   | `getProperties`                  |
-| Runtime   | `evaluate`                       |
-| Profiler  | `enable` / `disable`             |
+### 环境要求
 
-发出的 CDP 事件：`Debugger.scriptParsed`、`Debugger.scriptFailedToParse`、
-`Debugger.paused`、`Debugger.resumed`、`Runtime.consoleAPICalled`、
-`Runtime.executionContextCreated`。
+| 平台    | 编译器                         | 其它        |
+|---------|-------------------------------|------------|
+| Windows | MSVC (VS2019+) 或 MinGW-w64   | CMake ≥ 3.10 |
+| Linux   | GCC 或 Clang                   | CMake ≥ 3.10 |
 
-## 调试器特性
+### Windows (MSVC)
 
-- **断点** — 支持基于 URL 或 URL 正则的行断点，可启用 / 禁用。
-- **单步** — step over / into / out，以及 pause / resume。
-- **`debugger;` 语句** — 用户代码中可达的 `debugger;` 语句无需断点即触发暂停。
-- **调用栈检视** — 完整的 JS 调用栈，含文件 / 函数 / 行号。
-- **作用域链** — 每帧除 **Local**（参数 + 局部变量）外，还会暴露一个
-  **Closure** 作用域（从外层函数捕获的闭包变量）；其值通过 `var_refs`
-  实时读取，会反映内层函数对变量的修改。
-- **`Debugger.setVariableValue`** — 在暂停状态下修改任意栈帧上的参数 /
-  局部 / 闭包变量；`const` 绑定与 TDZ 状态会返回明确错误。
-- **`Debugger.evaluateOnCallFrame`** — 在某个暂停栈帧的**词法环境**下求
-  值表达式，可直接访问该帧的参数、局部、闭包变量以及全局；底层使用
-  `JS_EvalInStackFrame()`。
-- **`Debugger.scriptParsed` / `scriptFailedToParse`** — 脚本加载与解析失败
-  （SyntaxError）时分别推送。
+```powershell
+# 1. 打开 VS 开发者命令行（或手动初始化环境）
+& "D:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+# 2. 配置 + 编译
+mkdir build
+cd build
+cmake .. -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Debug
+nmake
+```
+
+编译产物在 `build/debugger/qjs_debug.exe`。
+
+### Windows (MinGW)
+
+```bash
+mkdir build && cd build
+cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Debug
+mingw32-make
+```
+
+### Linux
+
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+make -j$(nproc)
+```
+
+### 关键构建选项说明
+
+- **MSVC < 17.5**：自动注入 `compat/msvc/stdatomic.h` 垫片解决缺失 C11 `<stdatomic.h>` 的问题
+- **无需编译时宏**：调试接口使用专用的 `OP_debug` 操作码，始终在语句边界发射。未设置处理程序时运行时开销几乎为零（仅一次 `unlikely` 分支判断）。可随时通过 `JS_SetDebugTraceHandler()` 挂载处理程序。`DIRECT_DISPATCH`（computed goto）保持完全启用。
+- **`JSDebugTraceFunc` 回调签名**：`filename` 和 `funcname` 现在以 `JSAtom` 形式传入（而非 `const char*`）。在回调内部通过 `JS_AtomToCString()` / `JS_FreeCString()` 按需转换为字符串。若仅需与已知断点位置比较，可直接对比 atom 值，无需堆分配。
+
+## 架构概览
+
+```
+  VS Code (DevTools 前端)
+       │
+       │  WebSocket (ws://127.0.0.1:9229/debug)
+       ▼
+  ┌─────────────────┐
+  │ WebSocketServer │  接受连接、WebSocket 握手、帧编解码
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │   CDPHandler    │  解析 CDP JSON 消息，分发到对应 domain 处理
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │  DebugSession   │  调试核心逻辑
+  │  ─ 断点管理      │  set/remove breakpoint
+  │  ─ 单步控制      │  step over / into / out / continue
+  │  ─ 暂停/恢复     │  pause / resume
+  │  ─ 调用栈捕获    │  capture call frames + scope variables
+  │  ─ debug_trace   │  OP_debug 回调（检查断点/单步）
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │   QuickJS 引擎   │  执行 JS 脚本，通过调试回调触发
+  │  ─ JS_SetDebugTraceHandler()     设置/清除调试跟踪回调
+  │  ─ JSDebugTraceFunc(ctx, JSAtom filename, JSAtom funcname, line, col, flags, opaque)
+  │  ─ OP_debug opcode               语句边界触发回调
+  │  ─ JS_GetStackDepth()            获取调用栈深度
+  │  ─ JS_GetLocalVariablesAtLevel() 获取指定层级局部变量
+  │  ─ JS_FreeLocalVariables()       释放变量数组
+  └─────────────────┘
+```
+
+### 调试流程
+
+1. `qjs_debug` 启动 → 加载脚本 → 在端口 9229 启动 WebSocket 服务，等待调试器连接
+2. VS Code 通过 `launch.json` 的 attach 配置连接到 `ws://127.0.0.1:9229/debug`
+3. VS Code 发送 `Debugger.enable`、`Debugger.setBreakpointByUrl` 等 CDP 命令
+4. `CDPHandler` 解析消息并调用 `DebugSession` 设置断点
+5. `Runtime.runIfWaitingForDebugger` 解除阻塞，开始执行脚本
+6. QuickJS 在语句边界触发 `OP_debug` 操作码 → 调用调试回调 → 检查断点/单步条件
+7. 命中断点时 `do_pause()` 捕获调用栈和变量，发送 `Debugger.paused` 事件，阻塞等待
+8. VS Code 收到暂停事件后显示断点位置和变量；用户操作 continue/step 发送对应 CDP 命令
+9. `DebugSession` 收到命令后解除阻塞，脚本继续执行
 
 ## QuickJS 调试 API
 
