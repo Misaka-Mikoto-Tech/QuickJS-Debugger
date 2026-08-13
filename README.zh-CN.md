@@ -124,7 +124,7 @@ Waiting for debugger to connect...
 
 ```powershell
 # 1. 打开 VS 开发者命令行（或手动初始化环境）
-& "D:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+& "D:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 # 2. 配置 + 编译
 mkdir build

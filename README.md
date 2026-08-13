@@ -126,9 +126,11 @@ In addition to VS Code, you can also debug with Chrome:
 
 ### Windows (MSVC)
 
-Open a **Developer Command Prompt for VS** (or initialize the environment manually), then:
+```powershell
+# 1. Open a Developer Command Prompt for VS (or initialize the environment manually)
+& "D:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
 
-```cmd
+# 2. Configure + build
 mkdir build
 cd build
 cmake .. -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Debug
