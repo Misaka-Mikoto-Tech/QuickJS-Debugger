@@ -5,6 +5,10 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <utility>
+#include "json.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -105,29 +109,128 @@ std::string compute_ws_accept(const std::string& key) {
     return base64_encode(digest, 20);
 }
 
-// Parse HTTP header value by name (case-insensitive)
+std::string ascii_lower(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return text;
+}
+
+std::string trim(std::string text) {
+    const size_t first = text.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    return text.substr(first, text.find_last_not_of(" \t") - first + 1);
+}
+
+// Match complete header names, reject ambiguous duplicates and folded lines.
 std::string get_header(const std::string& request, const std::string& name) {
-    std::string lower_name = name;
-    std::string lower_req = request;
-    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
-    std::transform(lower_req.begin(), lower_req.end(), lower_req.begin(), ::tolower);
-    size_t pos = lower_req.find(lower_name + ":");
-    if (pos == std::string::npos) return "";
-    pos += lower_name.size() + 1;
-    while (pos < request.size() && request[pos] == ' ') pos++;
-    size_t end = request.find("\r\n", pos);
-    if (end == std::string::npos) end = request.size();
-    return request.substr(pos, end - pos);
+    std::string result;
+    bool found = false;
+    size_t pos = request.find("\r\n");
+    if (pos == std::string::npos) return {};
+    pos += 2;
+    while (pos < request.size()) {
+        const size_t end = request.find("\r\n", pos);
+        if (end == std::string::npos || end == pos) break;
+        const std::string line = request.substr(pos, end - pos);
+        if (line[0] == ' ' || line[0] == '\t') return {};
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos && ascii_lower(line.substr(0, colon)) == ascii_lower(name)) {
+            if (found) return {};
+            found = true;
+            result = trim(line.substr(colon + 1));
+        }
+        pos = end + 2;
+    }
+    return result;
+}
+
+bool valid_http_headers(const std::string& request) {
+    std::map<std::string, bool> names;
+    size_t pos = request.find("\r\n");
+    if (pos == std::string::npos) return false;
+    pos += 2;
+    while (pos < request.size()) {
+        const size_t end = request.find("\r\n", pos);
+        if (end == std::string::npos) return false;
+        if (end == pos) return end + 2 == request.size();
+        const std::string line = request.substr(pos, end - pos);
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos || colon == 0) return false;
+        for (size_t i = 0; i < colon; ++i) {
+            const auto c = static_cast<unsigned char>(line[i]);
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || std::string("!#$%&'*+-.^_\x60|~").find(static_cast<char>(c)) != std::string::npos))
+                return false;
+        }
+        for (size_t i = colon + 1; i < line.size(); ++i) {
+            const auto c = static_cast<unsigned char>(line[i]);
+            if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
+        }
+        if (!names.emplace(ascii_lower(line.substr(0, colon)), true).second) return false;
+        pos = end + 2;
+    }
+    return false;
+}
+
+bool header_token(const std::string& text, const std::string& token) {
+    size_t start = 0;
+    while (start < text.size()) {
+        const size_t end = text.find(',', start);
+        if (ascii_lower(trim(text.substr(start, end - start))) == token) return true;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return false;
 }
 
 std::string get_request_path(const std::string& request) {
-    // GET /path HTTP/1.1
-    size_t start = request.find(' ');
-    if (start == std::string::npos) return "/";
-    start++;
-    size_t end = request.find(' ', start);
-    if (end == std::string::npos) return "/";
-    return request.substr(start, end - start);
+    if (request.rfind("GET ", 0) != 0) return {};
+    const size_t end = request.find(' ', 4);
+    if (end == std::string::npos || request.compare(end, 11, " HTTP/1.1\r\n") != 0) return {};
+    return request.substr(4, end - 4);
+}
+
+bool valid_ws_key(const std::string& key) {
+    if (key.size() != 24 || key.substr(22) != "==") return false;
+    static const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < 22; ++i)
+        if (alphabet.find(key[i]) == std::string::npos) return false;
+    return (alphabet.find(key[21]) & 15) == 0;
+}
+
+bool set_blocking(socket_t socket, bool blocking) {
+#ifdef _WIN32
+    u_long mode = blocking ? 0 : 1;
+    return ioctlsocket(socket, FIONBIO, &mode) == 0;
+#else
+    const int flags = fcntl(socket, F_GETFL, 0);
+    return flags >= 0 && fcntl(socket, F_SETFL, blocking ? flags & ~O_NONBLOCK : flags | O_NONBLOCK) == 0;
+#endif
+}
+
+bool wait_readable(socket_t socket, long milliseconds) {
+    fd_set sockets;
+    FD_ZERO(&sockets);
+    FD_SET(socket, &sockets);
+    timeval timeout{milliseconds / 1000, (milliseconds % 1000) * 1000};
+    return select(static_cast<int>(socket) + 1, &sockets, nullptr, nullptr, &timeout) > 0;
+}
+
+bool wait_writable(socket_t socket, long milliseconds) {
+    fd_set sockets;
+    FD_ZERO(&sockets);
+    FD_SET(socket, &sockets);
+    timeval timeout{milliseconds / 1000, (milliseconds % 1000) * 1000};
+    return select(static_cast<int>(socket) + 1, nullptr, &sockets, nullptr, &timeout) > 0;
+}
+
+bool retry_socket_error() {
+    const int error = platform_socket_error();
+#ifdef _WIN32
+    return error == WSAEWOULDBLOCK || error == WSAEINTR;
+#else
+    return error == EWOULDBLOCK || error == EAGAIN || error == EINTR;
+#endif
 }
 
 } // anonymous namespace
@@ -136,353 +239,343 @@ std::string get_request_path(const std::string& request) {
 // WebSocketServer implementation
 // ============================================================
 
-WebSocketServer::WebSocketServer() = default;
+struct WebSocketServer::Network {
+    const bool initialized = platform_socket_init();
+    ~Network() { if (initialized) platform_socket_cleanup(); }
+};
 
-WebSocketServer::~WebSocketServer() {
-    stop();
-}
+struct WebSocketServer::Socket {
+    socket_t handle;
+    std::shared_ptr<Network> network;
+    std::atomic<bool> closed{false};
+
+    Socket(socket_t value, std::shared_ptr<Network> owner) : handle(value), network(std::move(owner)) {}
+    void cancel() {
+        if (closed.exchange(true)) return;
+#ifdef _WIN32
+        shutdown(handle, SD_BOTH);
+#else
+        shutdown(handle, SHUT_RDWR);
+#endif
+    }
+    ~Socket() { cancel(); close_socket(handle); }
+};
+
+WebSocketServer::WebSocketServer() = default;
+WebSocketServer::~WebSocketServer() { stop(); }
 
 bool WebSocketServer::start(int port) {
-    if (!platform_socket_init()) {
-        fprintf(stderr, "[WS] Socket init failed\n");
-        return false;
-    }
-
-    // SHA-1 / WebSocket handshake self-test (RFC 6455 example)
-    {
-        std::string test_input = std::string("dGhlIHNhbXBsZSBub25jZQ==") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-        uint8_t test_digest[20];
-        sha1_hash(test_input.data(), test_input.size(), test_digest);
-        fprintf(stderr, "[WS] SHA-1 hex: ");
-        for (int i = 0; i < 20; i++) fprintf(stderr, "%02x", test_digest[i]);
-        fprintf(stderr, "\n");
-        std::string test = base64_encode(test_digest, 20);
-        const char* expected = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
-        fprintf(stderr, "[WS] SHA-1 self-test: got='%s' expected='%s' %s\n",
-                test.c_str(), expected,
-                (test == expected) ? "OK" : "MISMATCH!");
-    }
-
-    listen_sock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listen_sock_ == INVALID_SOCK) {
-        fprintf(stderr, "[WS] Cannot create socket\n");
-        return false;
-    }
-
-    // Allow port reuse
-    int opt = 1;
-    setsockopt(listen_sock_, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-
-    if (bind(listen_sock_, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-        fprintf(stderr, "[WS] Bind failed on port %d (error %d)\n", port, platform_socket_error());
-        close_socket(listen_sock_);
-        listen_sock_ = INVALID_SOCK;
-        return false;
-    }
-
-    if (listen(listen_sock_, 1) != 0) {
-        fprintf(stderr, "[WS] Listen failed\n");
-        close_socket(listen_sock_);
-        listen_sock_ = INVALID_SOCK;
-        return false;
-    }
-
-    port_ = port;
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (listen_sock_ || port < 0 || port > 65535) return false;
+    if (!network_) network_ = std::make_shared<Network>();
+    if (!network_->initialized) return false;
+    const socket_t handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (handle == INVALID_SOCK) return false;
+    auto listener = std::make_shared<Socket>(handle, network_);
+    const int option = 1;
+#ifdef _WIN32
+    // SO_REUSEADDR on Windows would allow another process to hijack this port.
+    if (setsockopt(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        reinterpret_cast<const char*>(&option), sizeof(option)) != 0) return false;
+#else
+    setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+#endif
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (bind(handle, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+        listen(handle, 1) != 0 || !set_blocking(handle, false)) return false;
+    socklen_t size = sizeof(address);
+    if (getsockname(handle, reinterpret_cast<sockaddr*>(&address), &size) != 0) return false;
+    port_.store(ntohs(address.sin_port));
+    listen_sock_ = std::move(listener);
+    stopped_.store(false);
     return true;
+}
+
+WebSocketServer::SocketPtr WebSocketServer::client_snapshot() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return client_sock_;
+}
+
+void WebSocketServer::close_client(const SocketPtr& client) {
+    if (!client) return;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (client_sock_ == client) {
+            connected_.store(false);
+            client_sock_.reset();
+        }
+    }
+    client->cancel();
 }
 
 void WebSocketServer::stop() {
-    disconnect();
-    if (listen_sock_ != INVALID_SOCK) {
-        close_socket(listen_sock_);
-        listen_sock_ = INVALID_SOCK;
+    SocketPtr client, listener;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        stopped_.store(true);
+        connected_.store(false);
+        client = std::exchange(client_sock_, {});
+        listener = std::exchange(listen_sock_, {});
     }
-    platform_socket_cleanup();
+    // No send/I/O lock is held. Nonblocking I/O and bounded readiness waits observe
+    // cancellation even on platforms where shutdown does not interrupt a send.
+    if (client) client->cancel();
+    if (listener) listener->cancel();
 }
 
-void WebSocketServer::disconnect() {
-    connected_.store(false);
-    if (client_sock_ != INVALID_SOCK) {
-        close_socket(client_sock_);
-        client_sock_ = INVALID_SOCK;
-    }
-}
+void WebSocketServer::disconnect() { close_client(client_snapshot()); }
 
-std::string WebSocketServer::read_http_request(socket_t sock) {
+std::string WebSocketServer::read_http_request(const SocketPtr& client) {
     std::string request;
-    char buf[1];
-    while (request.size() < 8192) {
-        int n = recv(sock, buf, 1, 0);
-        if (n <= 0) return "";
-        request += buf[0];
-        if (request.size() >= 4 &&
-            request.substr(request.size()-4) == "\r\n\r\n") {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (request.size() < 8192 && !stopped_.load() && !client->closed.load() &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (!wait_readable(client->handle, 100)) continue;
+        char byte = 0;
+        const int count = recv(client->handle, &byte, 1, 0);
+        if (count < 0 && retry_socket_error()) continue;
+        if (count != 1 || byte == '\0') return {};
+        request += byte;
+        if (request.size() >= 4 && request.compare(request.size() - 4, 4, "\r\n\r\n") == 0)
             return request;
-        }
     }
-    return "";
+    return {};
 }
 
 bool WebSocketServer::wait_for_connection(const std::string& target_name,
-                                           const std::string& target_url) {
+                                          const std::string& target_url) {
+    if (target_name.size() > 4096 || target_url.size() > 4096) return false;
     target_name_ = target_name;
     target_url_ = target_url;
-
-    while (true) {
-        struct sockaddr_in client_addr{};
-        socklen_t addr_len = sizeof(client_addr);
-        socket_t sock = accept(listen_sock_, (struct sockaddr*)&client_addr, &addr_len);
-        if (sock == INVALID_SOCK) {
-            fprintf(stderr, "[WS] Accept failed\n");
-            return false;
+    SocketPtr listener;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        listener = listen_sock_;
+    }
+    if (!listener) return false;
+    while (!stopped_.load() && !listener->closed.load()) {
+        if (!wait_readable(listener->handle, 100)) continue;
+        sockaddr_in address{};
+        socklen_t size = sizeof(address);
+        const socket_t handle = accept(listener->handle, reinterpret_cast<sockaddr*>(&address), &size);
+        if (handle == INVALID_SOCK) continue;
+        auto client = std::make_shared<Socket>(handle, network_);
+        if (ntohl(address.sin_addr.s_addr) != INADDR_LOOPBACK || !set_blocking(handle, false)) continue;
+        const int flag = 1;
+        setsockopt(handle, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&flag), sizeof(flag));
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (stopped_.load() || listen_sock_ != listener) return false;
+            client_sock_ = client; // stop can now cancel HTTP/handshake reads as well.
         }
-
-        // Disable Nagle for low latency
-        int flag = 1;
-        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&flag, sizeof(flag));
-
-        std::string request = read_http_request(sock);
-        if (request.empty()) {
-            close_socket(sock);
+        const std::string request = read_http_request(client);
+        const std::string path = get_request_path(request);
+        const std::string host = ascii_lower(get_header(request, "Host"));
+        const std::string suffix = ":" + std::to_string(port());
+        const bool local_host = host == "127.0.0.1" + suffix || host == "localhost" + suffix ||
+            (port() == 80 && (host == "127.0.0.1" || host == "localhost"));
+        if (path.empty() || !valid_http_headers(request) || !local_host || !get_header(request, "Transfer-Encoding").empty() ||
+            (!get_header(request, "Content-Length").empty() && get_header(request, "Content-Length") != "0")) {
+            close_client(client);
             continue;
         }
-
-        std::string path = get_request_path(request);
-        std::string upgrade = get_header(request, "Upgrade");
-
-        // Check for WebSocket upgrade
-        std::string upgrade_lower = upgrade;
-        std::transform(upgrade_lower.begin(), upgrade_lower.end(), upgrade_lower.begin(), ::tolower);
-
-        if (upgrade_lower == "websocket") {
-            // Log the upgrade request for debugging
-            fprintf(stderr, "[WS] Upgrade request on path '%s':\n", path.c_str());
-            // Print key headers
-            fprintf(stderr, "[WS]   Sec-WebSocket-Key: %s\n", get_header(request, "Sec-WebSocket-Key").c_str());
-            fprintf(stderr, "[WS]   Sec-WebSocket-Version: %s\n", get_header(request, "Sec-WebSocket-Version").c_str());
-            fprintf(stderr, "[WS]   Sec-WebSocket-Protocol: %s\n", get_header(request, "Sec-WebSocket-Protocol").c_str());
-
-            client_sock_ = sock;
-            if (!do_websocket_handshake(request)) {
-                fprintf(stderr, "[WS] Handshake failed, waiting for new connection\n");
-                close_socket(sock);
-                client_sock_ = INVALID_SOCK;
-                continue;
+        if (ascii_lower(get_header(request, "Upgrade")) == "websocket") {
+            if (path == "/debug" && do_websocket_handshake(client, request)) {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                if (!stopped_.load() && client_sock_ == client && !client->closed.load()) {
+                    connected_.store(true);
+                    return true;
+                }
             }
-            connected_.store(true);
-            fprintf(stderr, "[WS] DevTools connected (path=%s)\n", path.c_str());
-            return true;
+            close_client(client);
+            continue;
         }
-
-        // Handle HTTP discovery endpoints
         if (path == "/json/version") {
-            std::string body = "{\"Browser\":\"QuickJS-Debug/1.0\",\"Protocol-Version\":\"1.3\"}";
-            send_http_response(sock, 200, "OK", "application/json", body);
-            close_socket(sock);
-            continue;
-        }
-
-        if (path == "/json" || path == "/json/list") {
-            char body[2048];
-            snprintf(body, sizeof(body),
-                "[{"
-                "\"description\":\"QuickJS instance\","
-                "\"devtoolsFrontendUrl\":\"devtools://devtools/bundled/js_app.html?experiments=true&v8only=true&ws=127.0.0.1:%d/debug\","
-                "\"id\":\"main\","
-                "\"title\":\"%s\","
-                "\"type\":\"node\","
-                "\"url\":\"%s\","
-                "\"webSocketDebuggerUrl\":\"ws://127.0.0.1:%d/debug\""
-                "}]",
-                port_, target_name_.c_str(), target_url_.c_str(), port_);
-            send_http_response(sock, 200, "OK", "application/json", body);
-            close_socket(sock);
-            continue;
-        }
-
-        // Unknown path
-        send_http_response(sock, 404, "Not Found", "text/plain", "Not Found");
-        close_socket(sock);
+            send_http_response(client, 200, "OK", "application/json",
+                "{\"Browser\":\"Twill QuickJS\",\"Protocol-Version\":\"1.3\"}");
+        } else if (path == "/json" || path == "/json/list") {
+            auto target = json::Value::object();
+            target.set("description", "Twill embedded QuickJS");
+            target.set("id", "main");
+            target.set("title", target_name_);
+            target.set("type", "node");
+            target.set("url", target_url_);
+            target.set("webSocketDebuggerUrl", "ws://127.0.0.1:" + std::to_string(port()) + "/debug");
+            auto targets = json::Value::array();
+            targets.push(target);
+            send_http_response(client, 200, "OK", "application/json", targets.serialize());
+        } else send_http_response(client, 404, "Not Found", "text/plain", "Not Found");
+        close_client(client);
     }
+    return false;
 }
 
-bool WebSocketServer::send_http_response(socket_t sock, int code, const std::string& status,
-                                          const std::string& content_type, const std::string& body) {
-    char header[512];
-    snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s; charset=UTF-8\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        code, status.c_str(), content_type.c_str(), body.size());
-
-    std::string response = std::string(header) + body;
-    int sent = ::send(sock, response.c_str(), (int)response.size(), 0);
-    return sent == (int)response.size();
+bool WebSocketServer::send_all(const SocketPtr& client, const void* buffer, size_t length) {
+    const char* bytes = static_cast<const char*>(buffer);
+    size_t sent = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (sent < length && !stopped_.load() && !client->closed.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (!wait_writable(client->handle, 100)) continue;
+        const size_t chunk = (std::min)(length - sent, size_t{65536});
+        const int count = ::send(client->handle, bytes + sent, static_cast<int>(chunk), 0);
+        if (count < 0 && retry_socket_error()) continue;
+        if (count <= 0) return false;
+        sent += static_cast<size_t>(count);
+    }
+    return sent == length;
 }
 
-bool WebSocketServer::do_websocket_handshake(const std::string& request) {
-    std::string key = get_header(request, "Sec-WebSocket-Key");
-    if (key.empty()) {
-        fprintf(stderr, "[WS] Handshake failed: no Sec-WebSocket-Key\n");
-        return false;
-    }
+bool WebSocketServer::send_http_response(const SocketPtr& client, int code, const std::string& status,
+                                         const std::string& content_type, const std::string& body) {
+    if (body.size() > json::Value::max_output_bytes) return false;
+    const std::string header = "HTTP/1.1 " + std::to_string(code) + " " + status +
+        "\r\nContent-Type: " + content_type + "; charset=UTF-8\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+    return send_all(client, header.data(), header.size()) && send_all(client, body.data(), body.size());
+}
 
-    std::string accept = compute_ws_accept(key);
-    std::string protocol = get_header(request, "Sec-WebSocket-Protocol");
-
-    // Log handshake details
-    fprintf(stderr, "[WS] Handshake: key='%s' protocol='%s'\n",
-            key.c_str(), protocol.c_str());
-
-    std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
-                           "Upgrade: websocket\r\n"
-                           "Connection: Upgrade\r\n"
-                           "Sec-WebSocket-Accept: " + accept + "\r\n";
-    if (!protocol.empty()) {
-        response += "Sec-WebSocket-Protocol: " + protocol + "\r\n";
-    }
-    response += "\r\n";
-
-    fprintf(stderr, "[WS] Sending handshake response (%d bytes):\n%s", (int)response.size(), response.c_str());
-
-    int len = (int)response.size();
-    return ::send(client_sock_, response.c_str(), len, 0) == len;
+bool WebSocketServer::do_websocket_handshake(const SocketPtr& client, const std::string& request) {
+    const std::string key = get_header(request, "Sec-WebSocket-Key");
+    if (!valid_ws_key(key) || get_header(request, "Sec-WebSocket-Version") != "13" ||
+        !header_token(get_header(request, "Connection"), "upgrade")) return false;
+    // Native CDP clients send no Origin. Do not let arbitrary web origins drive this
+    // loopback-only development endpoint through a cross-site WebSocket.
+    const std::string origin = ascii_lower(get_header(request, "Origin"));
+    if (!origin.empty() && origin != "devtools://devtools" &&
+        origin != "http://localhost:" + std::to_string(port()) &&
+        origin != "http://127.0.0.1:" + std::to_string(port())) return false;
+    const std::string response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Accept: " + compute_ws_accept(key) + "\r\n\r\n";
+    return send_all(client, response.data(), response.size());
 }
 
 bool WebSocketServer::send(const std::string& message) {
-    std::lock_guard<std::mutex> lock(send_mutex_);
-    if (!connected_.load() || client_sock_ == INVALID_SOCK) return false;
-    return send_ws_frame(0x01, (const uint8_t*)message.data(), message.size());
+    const auto client = client_snapshot();
+    if (!client || !connected_.load()) return false;
+    if (message.size() > json::Value::max_output_bytes || !json::Value::is_valid_utf8(message)) {
+        close_client(client);
+        return false;
+    }
+    bool success = false;
+    {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        success = send_ws_frame(client, 0x01, reinterpret_cast<const uint8_t*>(message.data()), message.size());
+    }
+    if (!success) close_client(client);
+    return success;
 }
 
 std::string WebSocketServer::receive() {
-    if (!connected_.load() || client_sock_ == INVALID_SOCK) {
-        fprintf(stderr, "[WS] receive(): not connected (connected=%d sock=%d)\n",
-                (int)connected_.load(), (int)(client_sock_ != INVALID_SOCK));
-        return "";
+    const auto client = client_snapshot();
+    if (!client || !connected_.load()) return {};
+    std::string message;
+    bool fragmented = false;
+    // Control/empty-fragment floods do not recurse or monopolize this request forever.
+    for (size_t frames = 0; frames < 1024 && !stopped_.load(); ++frames) {
+        std::string payload;
+        uint8_t opcode = 0;
+        bool final = false;
+        if (!read_ws_frame(client, payload, opcode, final)) break;
+        if (opcode == 0x08) {
+            if (payload.size() == 1) break;
+            if (payload.size() >= 2) {
+                const auto code = (static_cast<unsigned char>(payload[0]) << 8) |
+                    static_cast<unsigned char>(payload[1]);
+                if (code < 1000 || code >= 5000 || code == 1004 || code == 1005 ||
+                    code == 1006 || code == 1015 || (code >= 1016 && code < 3000) ||
+                    !json::Value::is_valid_utf8(payload.substr(2))) break;
+            }
+            { std::lock_guard<std::mutex> lock(send_mutex_);
+              send_ws_frame(client, 0x08, reinterpret_cast<const uint8_t*>(payload.data()), payload.size()); }
+            break;
+        }
+        if (opcode == 0x09 || opcode == 0x0a) {
+            if (opcode == 0x09) {
+                std::lock_guard<std::mutex> lock(send_mutex_);
+                if (!send_ws_frame(client, 0x0a, reinterpret_cast<const uint8_t*>(payload.data()), payload.size())) break;
+            }
+            continue;
+        }
+        if (opcode == 0x01) {
+            if (fragmented) break;
+            fragmented = !final;
+        } else if (opcode == 0x00) {
+            if (!fragmented) break;
+        } else break; // CDP is text only; binary/unknown extensions are unsupported.
+        if (payload.size() > json::Value::max_input_bytes - message.size()) break;
+        message += payload;
+        if (final) {
+            if (!json::Value::is_valid_utf8(message)) break;
+            return message;
+        }
     }
-
-    std::string payload;
-    uint8_t opcode;
-    if (!read_ws_frame(payload, opcode)) {
-        fprintf(stderr, "[WS] receive(): read_ws_frame failed\n");
-        connected_.store(false);
-        return "";
-    }
-
-    if (opcode == 0x08) {
-        // Close frame
-        connected_.store(false);
-        // Send close frame back
-        std::lock_guard<std::mutex> lock(send_mutex_);
-        send_ws_frame(0x08, nullptr, 0);
-        return "";
-    }
-
-    if (opcode == 0x09) {
-        // Ping -> Pong
-        std::lock_guard<std::mutex> lock(send_mutex_);
-        send_ws_frame(0x0A, (const uint8_t*)payload.data(), payload.size());
-        return receive(); // Read next frame
-    }
-
-    if (opcode == 0x0A) {
-        // Pong - ignore
-        return receive();
-    }
-
-    return payload;
+    close_client(client);
+    return {};
 }
 
-bool WebSocketServer::send_ws_frame(uint8_t opcode, const uint8_t* data, size_t len) {
-    uint8_t header[10];
-    size_t header_len;
-
-    header[0] = 0x80 | (opcode & 0x0F); // FIN + opcode
-
-    if (len < 126) {
-        header[1] = (uint8_t)len;
-        header_len = 2;
-    } else if (len < 65536) {
+bool WebSocketServer::send_ws_frame(const SocketPtr& client, uint8_t opcode, const uint8_t* data, size_t len) {
+    if (!client || client->closed.load() || len > json::Value::max_output_bytes) return false;
+    uint8_t header[10] = {static_cast<uint8_t>(0x80 | opcode)};
+    size_t header_len = 2;
+    if (len < 126) header[1] = static_cast<uint8_t>(len);
+    else if (len < 65536) {
         header[1] = 126;
-        header[2] = (uint8_t)(len >> 8);
-        header[3] = (uint8_t)(len & 0xFF);
+        header[2] = static_cast<uint8_t>(len >> 8);
+        header[3] = static_cast<uint8_t>(len);
         header_len = 4;
     } else {
         header[1] = 127;
-        for (int i = 0; i < 8; i++)
-            header[2+i] = (uint8_t)(len >> ((7-i)*8));
+        const uint64_t length = len;
+        for (int i = 0; i < 8; ++i) header[2 + i] = static_cast<uint8_t>(length >> ((7 - i) * 8));
         header_len = 10;
     }
-
-    if (::send(client_sock_, (const char*)header, (int)header_len, 0) != (int)header_len)
-        return false;
-
-    if (len > 0 && data) {
-        size_t sent = 0;
-        while (sent < len) {
-            int n = ::send(client_sock_, (const char*)data + sent, (int)(len - sent), 0);
-            if (n <= 0) return false;
-            sent += n;
-        }
-    }
-    return true;
+    return send_all(client, header, header_len) && (!len || send_all(client, data, len));
 }
 
-bool WebSocketServer::recv_exact(void* buf, size_t len) {
+bool WebSocketServer::recv_exact(const SocketPtr& client, void* buffer, size_t length) {
+    auto* bytes = static_cast<char*>(buffer);
     size_t received = 0;
-    while (received < len) {
-        int n = recv(client_sock_, (char*)buf + received, (int)(len - received), 0);
-        if (n <= 0) {
-            fprintf(stderr, "[WS] recv_exact: recv returned %d (wanted %zu more), error=%d\n",
-                    n, len - received, platform_socket_error());
-            return false;
-        }
-        received += n;
+    while (received < length && !stopped_.load() && !client->closed.load()) {
+        if (!wait_readable(client->handle, 100)) continue;
+        const size_t chunk = (std::min)(length - received, size_t{65536});
+        const int count = recv(client->handle, bytes + received, static_cast<int>(chunk), 0);
+        if (count < 0 && retry_socket_error()) continue;
+        if (count <= 0) return false;
+        received += static_cast<size_t>(count);
     }
-    return true;
+    return received == length;
 }
 
-bool WebSocketServer::read_ws_frame(std::string& payload, uint8_t& opcode) {
+bool WebSocketServer::read_ws_frame(const SocketPtr& client, std::string& payload, uint8_t& opcode, bool& final) {
     uint8_t header[2];
-    if (!recv_exact(header, 2)) return false;
-
-    opcode = header[0] & 0x0F;
-    bool masked = (header[1] & 0x80) != 0;
-    uint64_t payload_len = header[1] & 0x7F;
-
-    if (payload_len == 126) {
-        uint8_t ext[2];
-        if (!recv_exact(ext, 2)) return false;
-        payload_len = (uint64_t)ext[0] << 8 | ext[1];
-    } else if (payload_len == 127) {
-        uint8_t ext[8];
-        if (!recv_exact(ext, 8)) return false;
-        payload_len = 0;
-        for (int i = 0; i < 8; i++)
-            payload_len = (payload_len << 8) | ext[i];
+    if (!recv_exact(client, header, 2)) return false;
+    final = (header[0] & 0x80) != 0;
+    opcode = header[0] & 0x0f;
+    if ((header[0] & 0x70) != 0 || (header[1] & 0x80) == 0 ||
+        (opcode != 0 && opcode != 1 && opcode != 8 && opcode != 9 && opcode != 10)) return false;
+    const uint8_t length_code = header[1] & 0x7f;
+    uint64_t length = length_code;
+    if (length_code == 126) {
+        uint8_t extended[2];
+        if (!recv_exact(client, extended, 2)) return false;
+        length = (static_cast<uint64_t>(extended[0]) << 8) | extended[1];
+        if (length < 126) return false;
+    } else if (length_code == 127) {
+        uint8_t extended[8];
+        if (!recv_exact(client, extended, 8) || (extended[0] & 0x80)) return false;
+        length = 0;
+        for (const auto byte : extended) length = (length << 8) | byte;
+        if (length < 65536) return false;
     }
-
-    uint8_t mask[4] = {};
-    if (masked) {
-        if (!recv_exact(mask, 4)) return false;
-    }
-
-    payload.resize((size_t)payload_len);
-    if (payload_len > 0) {
-        if (!recv_exact(&payload[0], (size_t)payload_len)) return false;
-        if (masked) {
-            for (size_t i = 0; i < payload_len; i++)
-                payload[i] ^= mask[i % 4];
-        }
-    }
-
+    if (length > json::Value::max_input_bytes || ((opcode & 8) && (!final || length > 125))) return false;
+    uint8_t mask[4];
+    if (!recv_exact(client, mask, sizeof(mask))) return false;
+    payload.resize(static_cast<size_t>(length));
+    if (length && !recv_exact(client, payload.data(), payload.size())) return false;
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] ^= mask[i % 4];
     return true;
 }

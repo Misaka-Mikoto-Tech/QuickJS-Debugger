@@ -8,6 +8,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <charconv>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <system_error>
 
 namespace json {
 
@@ -39,8 +44,16 @@ public:
 
     bool get_bool() const { return bool_val_; }
     double get_number() const { return num_val_; }
-    int get_int() const { return static_cast<int>(num_val_); }
-    int64_t get_int64() const { return static_cast<int64_t>(num_val_); }
+    int get_int() const {
+        if (!std::isfinite(num_val_) || num_val_ < (std::numeric_limits<int>::min)() ||
+            num_val_ > (std::numeric_limits<int>::max)()) throw std::out_of_range("JSON integer range");
+        return static_cast<int>(num_val_);
+    }
+    int64_t get_int64() const {
+        if (!std::isfinite(num_val_) || num_val_ < -9223372036854775808.0 ||
+            num_val_ >= 9223372036854775808.0) throw std::out_of_range("JSON int64 range");
+        return static_cast<int64_t>(num_val_);
+    }
     const std::string& get_string() const { return str_val_; }
     const ArrayType& get_array() const { return arr_val_; }
     ArrayType& get_array() { return arr_val_; }
@@ -93,15 +106,48 @@ public:
         return *this;
     }
 
+    static constexpr size_t max_input_bytes = 1024 * 1024;
+    static constexpr size_t max_output_bytes = 4 * 1024 * 1024;
+    static constexpr size_t max_depth = 64;
+    static constexpr size_t max_nodes = 16384;
+
+    // Used by both JSON and the text-only CDP WebSocket transport.
+    static bool is_valid_utf8(const std::string& text) {
+        for (size_t i = 0; i < text.size();) {
+            const auto first = static_cast<unsigned char>(text[i++]);
+            if (first < 0x80) continue;
+            unsigned code = 0;
+            unsigned remaining = 0;
+            unsigned minimum = 0;
+            if (first >= 0xc2 && first <= 0xdf) { code = first & 0x1f; remaining = 1; minimum = 0x80; }
+            else if (first >= 0xe0 && first <= 0xef) { code = first & 0x0f; remaining = 2; minimum = 0x800; }
+            else if (first >= 0xf0 && first <= 0xf4) { code = first & 0x07; remaining = 3; minimum = 0x10000; }
+            else return false;
+            if (remaining > text.size() - i) return false;
+            while (remaining--) {
+                const auto next = static_cast<unsigned char>(text[i++]);
+                if ((next & 0xc0) != 0x80) return false;
+                code = (code << 6) | (next & 0x3f);
+            }
+            if (code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return false;
+        }
+        return true;
+    }
+
     std::string serialize() const {
-        std::ostringstream ss;
-        serialize_to(ss);
-        return ss.str();
+        std::string output;
+        size_t nodes = 0;
+        serialize_to(output, 0, nodes);
+        return output;
     }
 
     static Value parse(const std::string& str) {
-        size_t pos = 0;
-        return parse_value(str, pos);
+        if (str.size() > max_input_bytes || !is_valid_utf8(str)) fail("JSON byte/UTF-8 budget");
+        size_t pos = 0, nodes = 0;
+        Value result = parse_value(str, pos, 0, nodes);
+        skip_ws(str, pos);
+        if (pos != str.size()) fail("Trailing JSON data");
+        return result;
     }
 
 private:
@@ -112,193 +158,226 @@ private:
     ArrayType arr_val_;
     ObjectType obj_val_;
 
-    void serialize_to(std::ostringstream& ss) const {
-        switch (type_) {
-        case Type::Null:
-            ss << "null";
-            break;
-        case Type::Bool:
-            ss << (bool_val_ ? "true" : "false");
-            break;
-        case Type::Number: {
-            int64_t iv = static_cast<int64_t>(num_val_);
-            if (num_val_ == static_cast<double>(iv) && num_val_ >= -1e15 && num_val_ <= 1e15) {
-                ss << iv;
-            } else {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "%.17g", num_val_);
-                ss << buf;
+    [[noreturn]] static void fail(const char* message) { throw std::runtime_error(message); }
+
+    static void append(std::string& output, const std::string& text) {
+        if (text.size() > max_output_bytes - output.size()) fail("JSON output byte budget");
+        output += text;
+    }
+
+    static void append_char(std::string& output, char value) {
+        if (output.size() == max_output_bytes) fail("JSON output byte budget");
+        output += value;
+    }
+
+    static void serialize_string(std::string& output, const std::string& text) {
+        if (!is_valid_utf8(text)) fail("Invalid JSON output UTF-8");
+        append_char(output, '"');
+        for (const unsigned char c : text) {
+            switch (c) {
+            case '"': append(output, "\\\""); break;
+            case '\\': append(output, "\\\\"); break;
+            case '\b': append(output, "\\b"); break;
+            case '\f': append(output, "\\f"); break;
+            case '\n': append(output, "\\n"); break;
+            case '\r': append(output, "\\r"); break;
+            case '\t': append(output, "\\t"); break;
+            default:
+                if (c < 0x20) {
+                    static constexpr char hex[] = "0123456789abcdef";
+                    append(output, "\\u00");
+                    append_char(output, hex[c >> 4]);
+                    append_char(output, hex[c & 15]);
+                } else append_char(output, static_cast<char>(c));
             }
+        }
+        append_char(output, '"');
+    }
+
+    void serialize_to(std::string& output, size_t depth, size_t& nodes) const {
+        if (++nodes > max_nodes || depth > max_depth) fail("JSON output structure budget");
+        switch (type_) {
+        case Type::Null: append(output, "null"); break;
+        case Type::Bool: append(output, bool_val_ ? "true" : "false"); break;
+        case Type::Number: {
+            if (!std::isfinite(num_val_)) fail("Non-finite JSON number");
+            char buffer[64];
+            const auto conversion = std::to_chars(buffer, buffer + sizeof(buffer), num_val_,
+                std::chars_format::general, std::numeric_limits<double>::max_digits10);
+            if (conversion.ec != std::errc{}) fail("JSON number serialization");
+            append(output, std::string(buffer, conversion.ptr));
             break;
         }
-        case Type::String:
-            ss << '"';
-            for (unsigned char c : str_val_) {
-                switch (c) {
-                case '"':  ss << "\\\""; break;
-                case '\\': ss << "\\\\"; break;
-                case '\b': ss << "\\b"; break;
-                case '\f': ss << "\\f"; break;
-                case '\n': ss << "\\n"; break;
-                case '\r': ss << "\\r"; break;
-                case '\t': ss << "\\t"; break;
-                default:
-                    if (c < 0x20) {
-                        char buf[8];
-                        snprintf(buf, sizeof(buf), "\\u%04x", c);
-                        ss << buf;
-                    } else {
-                        ss << static_cast<char>(c);
-                    }
-                }
-            }
-            ss << '"';
-            break;
+        case Type::String: serialize_string(output, str_val_); break;
         case Type::Array:
-            ss << '[';
-            for (size_t i = 0; i < arr_val_.size(); i++) {
-                if (i > 0) ss << ',';
-                arr_val_[i].serialize_to(ss);
+            if (depth >= max_depth) fail("JSON output depth budget");
+            append_char(output, '[');
+            for (size_t i = 0; i < arr_val_.size(); ++i) {
+                if (i) append_char(output, ',');
+                arr_val_[i].serialize_to(output, depth + 1, nodes);
             }
-            ss << ']';
+            append_char(output, ']');
             break;
         case Type::Object:
-            ss << '{';
+            if (depth >= max_depth) fail("JSON output depth budget");
+            append_char(output, '{');
             { bool first = true;
-              for (const auto& kv : obj_val_) {
-                  if (!first) ss << ',';
+              for (const auto& entry : obj_val_) {
+                  if (++nodes > max_nodes) fail("JSON output node budget");
+                  if (!first) append_char(output, ',');
                   first = false;
-                  Value(kv.first).serialize_to(ss);
-                  ss << ':';
-                  kv.second.serialize_to(ss);
+                  serialize_string(output, entry.first);
+                  append_char(output, ':');
+                  entry.second.serialize_to(output, depth + 1, nodes);
               }
             }
-            ss << '}';
+            append_char(output, '}');
             break;
         }
     }
 
-    static void skip_ws(const std::string& s, size_t& p) {
-        while (p < s.size() && (s[p]==' '||s[p]=='\t'||s[p]=='\n'||s[p]=='\r')) p++;
+    static void skip_ws(const std::string& text, size_t& pos) {
+        while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t' ||
+               text[pos] == '\r' || text[pos] == '\n')) ++pos;
     }
 
-    static Value parse_value(const std::string& s, size_t& p) {
-        skip_ws(s, p);
-        if (p >= s.size()) return Value();
-        switch (s[p]) {
-        case '"': return parse_string(s, p);
-        case '{': return parse_object(s, p);
-        case '[': return parse_array(s, p);
-        case 't': case 'f': return parse_bool(s, p);
-        case 'n': return parse_null(s, p);
-        default:  return parse_number(s, p);
+    static unsigned hex_quad(const std::string& text, size_t& pos) {
+        if (text.size() - pos < 4) fail("Incomplete Unicode escape");
+        unsigned result = 0;
+        for (unsigned i = 0; i < 4; ++i) {
+            const char c = text[pos++];
+            unsigned digit = 0;
+            if (c >= '0' && c <= '9') digit = static_cast<unsigned>(c - '0');
+            else if (c >= 'a' && c <= 'f') digit = static_cast<unsigned>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') digit = static_cast<unsigned>(c - 'A' + 10);
+            else fail("Invalid Unicode hex digit");
+            result = (result << 4) | digit;
+        }
+        return result;
+    }
+
+    static void encode_utf8(std::string& result, unsigned code) {
+        if (code <= 0x7f) result += static_cast<char>(code);
+        else if (code <= 0x7ff) {
+            result += static_cast<char>(0xc0 | (code >> 6));
+            result += static_cast<char>(0x80 | (code & 0x3f));
+        } else if (code <= 0xffff) {
+            result += static_cast<char>(0xe0 | (code >> 12));
+            result += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
+            result += static_cast<char>(0x80 | (code & 0x3f));
+        } else {
+            result += static_cast<char>(0xf0 | (code >> 18));
+            result += static_cast<char>(0x80 | ((code >> 12) & 0x3f));
+            result += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
+            result += static_cast<char>(0x80 | (code & 0x3f));
         }
     }
 
-    static Value parse_string(const std::string& s, size_t& p) {
-        p++; // skip "
-        std::string r;
-        while (p < s.size() && s[p] != '"') {
-            if (s[p] == '\\') {
-                p++;
-                if (p >= s.size()) break;
-                switch (s[p]) {
-                case '"':  r += '"'; break;
-                case '\\': r += '\\'; break;
-                case '/':  r += '/'; break;
-                case 'b':  r += '\b'; break;
-                case 'f':  r += '\f'; break;
-                case 'n':  r += '\n'; break;
-                case 'r':  r += '\r'; break;
-                case 't':  r += '\t'; break;
-                case 'u':
-                    if (p + 4 < s.size()) {
-                        unsigned cp = (unsigned)std::stoul(s.substr(p+1, 4), nullptr, 16);
-                        if (cp < 0x80) {
-                            r += (char)cp;
-                        } else if (cp < 0x800) {
-                            r += (char)(0xC0 | (cp >> 6));
-                            r += (char)(0x80 | (cp & 0x3F));
-                        } else {
-                            r += (char)(0xE0 | (cp >> 12));
-                            r += (char)(0x80 | ((cp >> 6) & 0x3F));
-                            r += (char)(0x80 | (cp & 0x3F));
-                        }
-                        p += 4;
-                    }
-                    break;
-                default: r += s[p];
-                }
-            } else {
-                r += s[p];
+    static std::string parse_string(const std::string& text, size_t& pos) {
+        if (pos == text.size() || text[pos++] != '"') fail("Expected JSON string");
+        std::string result;
+        while (pos < text.size()) {
+            const auto c = static_cast<unsigned char>(text[pos++]);
+            if (c == '"') return result;
+            if (c < 0x20) fail("Unescaped JSON control character");
+            if (c != '\\') { result += static_cast<char>(c); continue; }
+            if (pos == text.size()) fail("Incomplete JSON escape");
+            switch (text[pos++]) {
+            case '"': result += '"'; break;
+            case '\\': result += '\\'; break;
+            case '/': result += '/'; break;
+            case 'b': result += '\b'; break;
+            case 'f': result += '\f'; break;
+            case 'n': result += '\n'; break;
+            case 'r': result += '\r'; break;
+            case 't': result += '\t'; break;
+            case 'u': {
+                unsigned code = hex_quad(text, pos);
+                if (code >= 0xd800 && code <= 0xdbff) {
+                    if (text.size() - pos < 6 || text[pos] != '\\' || text[pos + 1] != 'u')
+                        fail("Missing low Unicode surrogate");
+                    pos += 2;
+                    const unsigned low = hex_quad(text, pos);
+                    if (low < 0xdc00 || low > 0xdfff) fail("Invalid low Unicode surrogate");
+                    code = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+                } else if (code >= 0xdc00 && code <= 0xdfff) fail("Lone low Unicode surrogate");
+                encode_utf8(result, code);
+                break;
             }
-            p++;
+            default: fail("Unknown JSON escape");
+            }
         }
-        if (p < s.size()) p++; // skip closing "
-        return Value(std::move(r));
+        fail("Unterminated JSON string");
     }
 
-    static Value parse_number(const std::string& s, size_t& p) {
-        size_t start = p;
-        if (p < s.size() && s[p] == '-') p++;
-        while (p < s.size() && s[p] >= '0' && s[p] <= '9') p++;
-        if (p < s.size() && s[p] == '.') {
-            p++;
-            while (p < s.size() && s[p] >= '0' && s[p] <= '9') p++;
+    static bool digit(char c) { return c >= '0' && c <= '9'; }
+
+    static Value parse_number(const std::string& text, size_t& pos) {
+        const size_t start = pos;
+        if (pos < text.size() && text[pos] == '-') ++pos;
+        if (pos == text.size()) fail("Incomplete JSON number");
+        if (text[pos] == '0') ++pos;
+        else {
+            if (text[pos] < '1' || text[pos] > '9') fail("Invalid JSON number");
+            while (pos < text.size() && digit(text[pos])) ++pos;
         }
-        if (p < s.size() && (s[p] == 'e' || s[p] == 'E')) {
-            p++;
-            if (p < s.size() && (s[p] == '+' || s[p] == '-')) p++;
-            while (p < s.size() && s[p] >= '0' && s[p] <= '9') p++;
+        if (pos < text.size() && text[pos] == '.') {
+            ++pos;
+            if (pos == text.size() || !digit(text[pos])) fail("Missing fractional digits");
+            while (pos < text.size() && digit(text[pos])) ++pos;
         }
-        return Value(std::stod(s.substr(start, p - start)));
+        if (pos < text.size() && (text[pos] == 'e' || text[pos] == 'E')) {
+            ++pos;
+            if (pos < text.size() && (text[pos] == '+' || text[pos] == '-')) ++pos;
+            if (pos == text.size() || !digit(text[pos])) fail("Missing exponent digits");
+            while (pos < text.size() && digit(text[pos])) ++pos;
+        }
+        double value = 0;
+        const auto conversion = std::from_chars(text.data() + start, text.data() + pos, value,
+            std::chars_format::general);
+        if (conversion.ec != std::errc{} || conversion.ptr != text.data() + pos || !std::isfinite(value))
+            fail("JSON number outside finite range");
+        return Value(value);
     }
 
-    static Value parse_bool(const std::string& s, size_t& p) {
-        if (s.compare(p, 4, "true") == 0) { p += 4; return Value(true); }
-        if (s.compare(p, 5, "false") == 0) { p += 5; return Value(false); }
-        return Value();
-    }
-
-    static Value parse_null(const std::string& s, size_t& p) {
-        if (s.compare(p, 4, "null") == 0) { p += 4; }
-        return Value();
-    }
-
-    static Value parse_object(const std::string& s, size_t& p) {
-        p++; // skip {
-        Value obj = Value::object();
-        skip_ws(s, p);
-        if (p < s.size() && s[p] == '}') { p++; return obj; }
-        while (p < s.size()) {
-            skip_ws(s, p);
-            if (p >= s.size() || s[p] != '"') break;
-            Value key = parse_string(s, p);
-            skip_ws(s, p);
-            if (p < s.size() && s[p] == ':') p++;
-            Value val = parse_value(s, p);
-            obj.set(key.get_string(), val);
-            skip_ws(s, p);
-            if (p < s.size() && s[p] == ',') { p++; } else break;
+    static Value parse_value(const std::string& text, size_t& pos, size_t depth, size_t& nodes) {
+        if (++nodes > max_nodes || depth > max_depth) fail("JSON structure budget");
+        skip_ws(text, pos);
+        if (pos == text.size()) fail("Expected JSON value");
+        const char first = text[pos];
+        if (first == '"') return Value(parse_string(text, pos));
+        if (first == '{' || first == '[') {
+            if (depth >= max_depth) fail("JSON depth budget");
+            ++pos;
+            Value value = first == '{' ? Value::object() : Value::array();
+            const char closing = first == '{' ? '}' : ']';
+            skip_ws(text, pos);
+            if (pos < text.size() && text[pos] == closing) { ++pos; return value; }
+            for (;;) {
+                skip_ws(text, pos);
+                if (first == '{') {
+                    if (++nodes > max_nodes) fail("JSON node budget");
+                    const std::string key = parse_string(text, pos);
+                    if (value.has(key)) fail("Duplicate JSON object key");
+                    skip_ws(text, pos);
+                    if (pos == text.size() || text[pos++] != ':') fail("Expected JSON colon");
+                    value.set(key, parse_value(text, pos, depth + 1, nodes));
+                } else value.push(parse_value(text, pos, depth + 1, nodes));
+                skip_ws(text, pos);
+                if (pos == text.size()) fail("Unterminated JSON container");
+                const char delimiter = text[pos++];
+                if (delimiter == closing) return value;
+                if (delimiter != ',') fail("Expected JSON comma");
+            }
         }
-        skip_ws(s, p);
-        if (p < s.size() && s[p] == '}') p++;
-        return obj;
-    }
-
-    static Value parse_array(const std::string& s, size_t& p) {
-        p++; // skip [
-        Value arr = Value::array();
-        skip_ws(s, p);
-        if (p < s.size() && s[p] == ']') { p++; return arr; }
-        while (p < s.size()) {
-            arr.push(parse_value(s, p));
-            skip_ws(s, p);
-            if (p < s.size() && s[p] == ',') { p++; } else break;
+        for (const auto& literal : {std::string("true"), std::string("false"), std::string("null")}) {
+            if (text.compare(pos, literal.size(), literal) == 0) {
+                pos += literal.size();
+                if (literal == "null") return Value();
+                return Value(literal == "true");
+            }
         }
-        skip_ws(s, p);
-        if (p < s.size() && s[p] == ']') p++;
-        return arr;
+        return parse_number(text, pos);
     }
 };
 

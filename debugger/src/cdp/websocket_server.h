@@ -4,6 +4,7 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include <memory>
 
 class WebSocketServer {
 public:
@@ -24,23 +25,34 @@ public:
     std::string receive();
 
     bool is_connected() const { return connected_.load(); }
-    int port() const { return port_; }
+    int port() const { return port_.load(); }
 
     void disconnect();
 
 private:
-    bool send_http_response(socket_t sock, int code, const std::string& status,
+    // Outstanding I/O owns its socket; stop shuts it down but never closes/reuses
+    // its descriptor while another thread still holds a snapshot.
+    struct Network;
+    struct Socket;
+    using SocketPtr = std::shared_ptr<Socket>;
+    SocketPtr client_snapshot();
+    void close_client(const SocketPtr& client);
+    bool send_http_response(const SocketPtr& sock, int code, const std::string& status,
                             const std::string& content_type, const std::string& body);
-    bool do_websocket_handshake(const std::string& request);
-    bool send_ws_frame(uint8_t opcode, const uint8_t* data, size_t len);
-    bool read_ws_frame(std::string& payload, uint8_t& opcode);
-    bool recv_exact(void* buf, size_t len);
-    std::string read_http_request(socket_t sock);
+    bool do_websocket_handshake(const SocketPtr& sock, const std::string& request);
+    bool send_ws_frame(const SocketPtr& sock, uint8_t opcode, const uint8_t* data, size_t len);
+    bool read_ws_frame(const SocketPtr& sock, std::string& payload, uint8_t& opcode, bool& final);
+    bool recv_exact(const SocketPtr& sock, void* buf, size_t len);
+    bool send_all(const SocketPtr& sock, const void* buf, size_t len);
+    std::string read_http_request(const SocketPtr& sock);
 
-    socket_t listen_sock_ = INVALID_SOCK;
-    socket_t client_sock_ = INVALID_SOCK;
-    int port_ = 0;
+    SocketPtr listen_sock_;
+    SocketPtr client_sock_;
+    std::atomic<int> port_{0};
     std::atomic<bool> connected_{false};
+    std::atomic<bool> stopped_{true};
+    std::shared_ptr<Network> network_;
+    std::mutex state_mutex_;
     std::mutex send_mutex_;
     std::string target_name_;
     std::string target_url_;

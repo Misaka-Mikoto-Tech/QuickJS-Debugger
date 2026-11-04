@@ -1,1088 +1,298 @@
 #include "debug_session.h"
 #include <algorithm>
-#include <sstream>
-#include <cstdio>
-#include <cstring>
-#include <chrono>
-#include <thread>
-#include <regex>
+#include <cctype>
+#include <stdexcept>
 
-// ============================================================
-// URL / path helpers
-// ============================================================
-
-std::string DebugSession::normalize_url(const std::string& path) {
-    std::string r = path;
-    std::replace(r.begin(), r.end(), '\\', '/');
-    return r;
+namespace {
+std::string atom_text(JSContext* ctx, JSAtom atom) {
+    const char* value = JS_AtomToCString(ctx, atom);
+    std::string result = value ? value : "";
+    if (value) JS_FreeCString(ctx, value);
+    return result;
 }
-
-std::string DebugSession::to_file_url(const std::string& path) {
-    std::string norm = normalize_url(path);
-    if (norm.find("file://") == 0) return norm;
-    // If it looks like an absolute path (starts with / or X:/)
-    if (!norm.empty() && (norm[0] == '/' || (norm.size() >= 3 && norm[1] == ':'))) {
-        if (norm[0] != '/') {
-            norm = "/" + norm;
-        }
-        return "file://" + norm;
-    }
-    return norm;
-}
-
-static std::string to_lower(const std::string& s) {
-    std::string r = s;
-    std::transform(r.begin(), r.end(), r.begin(),
-                   [](unsigned char c) { return (char)tolower(c); });
-    return r;
-}
-
-static bool paths_match(const std::string& a, const std::string& b) {
+bool same_path(const std::string& a, const std::string& b) {
 #ifdef _WIN32
-    return to_lower(a) == to_lower(b);
+    auto lower = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value;
+    };
+    return lower(a) == lower(b);
 #else
     return a == b;
 #endif
 }
-
-// ============================================================
-// Constructor / Destructor
-// ============================================================
+}
 
 DebugSession::DebugSession() = default;
 DebugSession::~DebugSession() = default;
+void DebugSession::set_send_event(SendEventFn fn) { send_event_ = std::move(fn); }
+void DebugSession::set_pause_observer(PauseObserver fn) { pause_observer_ = std::move(fn); }
 
-void DebugSession::set_send_event(SendEventFn fn) {
-    send_event_ = std::move(fn);
+std::string DebugSession::normalize_url(const std::string& path) {
+    std::string value = path;
+    std::replace(value.begin(), value.end(), '\\', '/');
+    if (value.rfind("file:///", 0) == 0 && value.size() > 10 && value[9] == ':') value.erase(0, 8);
+    else if (value.rfind("file://", 0) == 0) value.erase(0, 7);
+    return value;
 }
-
-// ============================================================
-// Script management
-// ============================================================
-
-std::string DebugSession::add_script(const std::string& url, const std::string& source) {
+std::string DebugSession::to_file_url(const std::string& path) {
+    if (path.find("://") != std::string::npos) return path;
+    auto norm = normalize_url(path);
+    if (!norm.empty() && norm[0] == '/') return "file://" + norm;
+    if (norm.size() > 2 && norm[1] == ':') return "file:///" + norm;
+    return norm;
+}
+json::Value DebugSession::error(const std::string& message) {
+    auto result = json::Value::object(), detail = json::Value::object();
+    detail.set("code", -32000).set("message", message); result.set("error", detail); return result;
+}
+std::string DebugSession::add_script(const std::string& url, const std::string& source,
+        bool module, const std::string& map, const std::string& compile) {
     ScriptInfo info;
-    info.id = std::to_string(next_script_id_++);
-    info.url = normalize_url(url);
-    info.source = source;
-
-    // Count lines
-    int lines = 1;
-    for (char c : source) {
-        if (c == '\n') lines++;
-    }
-    info.end_line = lines;
-
+    info.id = std::to_string(scripts_.size() + 1);
+    info.url = to_file_url(url); info.source = source; info.is_module = module;
+    info.source_map_url = map; info.compile_filename = compile.empty() ? normalize_url(url) : normalize_url(compile);
+    info.end_line = 1 + static_cast<int>(std::count(source.begin(), source.end(), '\n'));
     scripts_.push_back(std::move(info));
-
-    // If debugger is enabled, send scriptParsed event
-    if (enabled_.load() && send_event_) {
-        const auto& si = scripts_.back();
-        auto params = json::Value::object();
-        params.set("scriptId", si.id);
-        params.set("url", to_file_url(si.url));
-        params.set("startLine", 0);
-        params.set("startColumn", 0);
-        params.set("endLine", si.end_line);
-        params.set("endColumn", 0);
-        params.set("executionContextId", 1);
-        params.set("hash", "");
-        params.set("isLiveEdit", false);
-        params.set("sourceMapURL", "");
-        params.set("hasSourceURL", false);
-        params.set("isModule", false);
-        params.set("length", (int)si.source.size());
-        send_event_("Debugger.scriptParsed", params);
-    }
-
     return scripts_.back().id;
 }
-
 const ScriptInfo* DebugSession::get_script_by_id(const std::string& id) const {
-    for (const auto& s : scripts_) {
-        if (s.id == id) return &s;
-    }
+    for (const auto& source : scripts_) if (source.id == id) return &source;
     return nullptr;
 }
-
+json::Value DebugSession::script_parsed(const ScriptInfo& source) const {
+    auto result = json::Value::object();
+    result.set("scriptId", source.id).set("url", source.url).set("startLine", 0).set("startColumn", 0)
+        .set("endLine", source.end_line).set("endColumn", 0).set("executionContextId", 1)
+        .set("hash", "").set("isLiveEdit", false).set("sourceMapURL", source.source_map_url)
+        .set("hasSourceURL", false).set("isModule", source.is_module).set("length", static_cast<int64_t>(source.source.size()));
+    return result;
+}
 std::string DebugSession::find_script_id(const std::string& filename) const {
-    std::string norm = normalize_url(filename);
-    for (const auto& s : scripts_) {
-        if (paths_match(s.url, norm)) return s.id;
-        // Also match by basename
-        std::string s_base = s.url;
-        auto pos = s_base.rfind('/');
-        if (pos != std::string::npos) s_base = s_base.substr(pos + 1);
-        std::string f_base = norm;
-        pos = f_base.rfind('/');
-        if (pos != std::string::npos) f_base = f_base.substr(pos + 1);
-        if (paths_match(s_base, f_base) && !s_base.empty()) return s.id;
+    const auto file = normalize_url(filename);
+    for (const auto& source : scripts_) {
+        if (same_path(file, source.compile_filename) || same_path(file, normalize_url(source.url))) return source.id;
     }
     return "0";
 }
-
-// ============================================================
-// Breakpoint management
-// ============================================================
-
-json::Value DebugSession::set_breakpoint_by_url(const std::string& url,
-                                                  int line_0based, int column_0based,
-                                                  bool is_regex) {
-    std::lock_guard<std::mutex> lock(bp_mutex_);
-
-    Breakpoint bp;
-    bp.id = next_bp_id_++;
-    bp.url = is_regex ? url : normalize_url(url);
-    bp.line = line_0based + 1; // Convert to 1-based for QuickJS
-    bp.column = column_0based;
-    bp.enabled = true;
-    bp.is_regex = is_regex;
-
+json::Value DebugSession::set_breakpoint_by_url(const std::string& url, int line, int column, bool regex) {
+    if (regex || line < 0 || column < 0 || url.size() > 4096) return error("Unsupported breakpoint URL/regex/location");
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (breakpoints_.size() >= 2048) return error("Breakpoint budget exceeded");
+    Breakpoint bp; bp.id = next_breakpoint_++; bp.url = normalize_url(url); bp.line = line + 1; bp.column = column;
+    for (const auto& source : scripts_) if (same_path(normalize_url(source.url), bp.url)) bp.script_id = source.id;
     breakpoints_[bp.id] = bp;
-
-    fprintf(stderr, "[DBG] Set breakpoint #%d: url='%s' line=%d (1-based)\n",
-            bp.id, bp.url.c_str(), bp.line);
-
-    // Build CDP result
-    std::string bp_id_str = std::to_string(bp.id) + ":" + std::to_string(line_0based) + ":0";
-
-    // Find matching script for resolved location
-    std::string script_id;
-    for (const auto& s : scripts_) {
-        if (is_regex) {
-            // Match regex against script URL (as file:// URL and raw path)
-            try {
-                std::regex re(bp.url, std::regex_constants::ECMAScript | std::regex_constants::icase);
-                std::string surl = to_file_url(s.url);
-                if (std::regex_search(surl, re) || std::regex_search(s.url, re)) {
-                    script_id = s.id;
-                    break;
-                }
-            } catch (...) {}
-        }
-        if (paths_match(s.url, bp.url) ||
-            to_lower(s.url).find(to_lower(bp.url)) != std::string::npos ||
-            to_lower(bp.url).find(to_lower(s.url)) != std::string::npos) {
-            script_id = s.id;
-            break;
-        }
-        // Match by basename
-        std::string s_base = s.url;
-        auto pos = s_base.rfind('/');
-        if (pos != std::string::npos) s_base = s_base.substr(pos + 1);
-        std::string b_base = bp.url;
-        pos = b_base.rfind('/');
-        if (pos != std::string::npos) b_base = b_base.substr(pos + 1);
-        if (paths_match(s_base, b_base) && !s_base.empty()) {
-            script_id = s.id;
-            break;
-        }
-    }
-
-    auto location = json::Value::object();
-    location.set("scriptId", script_id.empty() ? "0" : script_id);
-    location.set("lineNumber", line_0based);
-    location.set("columnNumber", column_0based);
-
     auto locations = json::Value::array();
-    locations.push(location);
-
-    auto result = json::Value::object();
-    result.set("breakpointId", bp_id_str);
-    result.set("locations", locations);
-
-    return result;
-}
-
-bool DebugSession::remove_breakpoint(const std::string& bp_id_str) {
-    std::lock_guard<std::mutex> lock(bp_mutex_);
-    // bp_id_str format: "N:line:col"
-    int bp_id = 0;
-    try {
-        bp_id = std::stoi(bp_id_str);
-    } catch (...) {
-        return false;
+    if (!bp.script_id.empty()) {
+        auto location = json::Value::object();
+        location.set("scriptId", bp.script_id).set("lineNumber", line).set("columnNumber", column); locations.push(location);
     }
-    return breakpoints_.erase(bp_id) > 0;
+    auto result = json::Value::object();
+    result.set("breakpointId", std::to_string(bp.id)).set("locations", locations); return result;
 }
-
-void DebugSession::set_breakpoints_active(bool active) {
-    std::lock_guard<std::mutex> lock(bp_mutex_);
-    bp_active_ = active;
-}
-
-bool DebugSession::check_breakpoint(const std::string& filename, int line) const {
-    std::lock_guard<std::mutex> lock(bp_mutex_);
-    if (!bp_active_) return false;
-
-    std::string norm_file = normalize_url(filename);
-    std::string file_url = to_file_url(norm_file);
-    std::string file_base = norm_file;
-    auto pos = file_base.rfind('/');
-    if (pos != std::string::npos) file_base = file_base.substr(pos + 1);
-
-    for (const auto& [id, bp] : breakpoints_) {
-        if (!bp.enabled) continue;
-        if (bp.line != line) continue;
-
-        if (bp.is_regex) {
-            // VS Code sends urlRegex — match against file URL and raw path
-            try {
-                std::regex re(bp.url, std::regex_constants::ECMAScript | std::regex_constants::icase);
-                if (std::regex_search(file_url, re) || std::regex_search(norm_file, re)) {
-                    return true;
-                }
-            } catch (...) {
-                // Malformed regex — fall through to plain matching
-            }
-        }
-
-        // Plain path matching (for url-based breakpoints or regex fallback)
-        std::string bp_base = bp.url;
-        auto bpos = bp_base.rfind('/');
-        if (bpos != std::string::npos) bp_base = bp_base.substr(bpos + 1);
-
-        if (paths_match(norm_file, bp.url) || paths_match(file_base, bp_base) ||
-            to_lower(norm_file).find(to_lower(bp.url)) != std::string::npos ||
-            to_lower(bp.url).find(to_lower(norm_file)) != std::string::npos) {
-            return true;
-        }
+bool DebugSession::remove_breakpoint(const std::string& id) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (auto it = breakpoints_.begin(); it != breakpoints_.end(); ++it) {
+        if (std::to_string(it->first) == id) { breakpoints_.erase(it); return true; }
     }
     return false;
 }
-
-json::Value DebugSession::set_variable_value(int scope_number,
-                                             const std::string& variable_name,
-                                             const json::Value& new_value_json,
-                                             const std::string& call_frame_id) {
-    (void)scope_number; // QuickJS resolves the slot by name across the frame
-
-    if (!paused_.load()) {
-        auto err = json::Value::object();
-        auto e = json::Value::object();
-        e.set("code", -32000);
-        e.set("message", "Not paused");
-        err.set("error", e);
-        return err;
-    }
-
-    // Serialize the CDP CallArgument to a JS expression we can evaluate on the
-    // JS thread.  CDP fields: { value?, unserializableValue?, objectId? }.
-    std::string expr;
-    if (new_value_json.has("unserializableValue")) {
-        // e.g. NaN, Infinity, -0, BigInt literals
-        expr = new_value_json["unserializableValue"].get_string();
-    } else if (new_value_json.has("objectId")) {
-        // Object references from a previous CDP response are not yet supported
-        // round-tripping; reject so the client surfaces a clear error.
-        auto err = json::Value::object();
-        auto e = json::Value::object();
-        e.set("code", -32000);
-        e.set("message", "objectId references are not supported in setVariableValue");
-        err.set("error", e);
-        return err;
-    } else if (new_value_json.has("value")) {
-        // Serialize the JSON value as a JS literal.  serialize() produces a
-        // JSON literal which is also a valid JS literal for primitives /
-        // arrays / objects of primitives.
-        expr = new_value_json["value"].serialize();
-    } else {
-        expr = "undefined";
-    }
-
-    int level = 0;
-    try { level = std::stoi(call_frame_id); } catch (...) {}
-
-    // Hand the request to the JS thread.
-    SetVarRequest req;
-    req.call_frame_level = level;
-    req.name = variable_name;
-    req.value_expr = std::move(expr);
-
-    {
-        std::unique_lock<std::mutex> lk(eval_mutex_);
-        pending_setvar_ = &req;
-    }
-    pause_cv_.notify_all();
-    {
-        std::unique_lock<std::mutex> lk(eval_mutex_);
-        eval_done_cv_.wait(lk, [&] { return req.ready; });
-        pending_setvar_ = nullptr;
-    }
-    return req.result;
+void DebugSession::set_breakpoints_active(bool value) { std::lock_guard<std::mutex> guard(mutex_); breakpoints_active_ = value; }
+void DebugSession::set_enabled(bool value) {
+    if (!value) { on_disconnect(); return; }
+    std::lock_guard<std::mutex> guard(mutex_); disconnected_ = false; enabled_ = true;
 }
-
-// ============================================================
-// Execution control
-// ============================================================
-
-void DebugSession::resume() {
-    step_mode_.store(StepMode::Continue);
-    pause_requested_.store(false);
-    paused_.store(false);
+void DebugSession::continue_with(StepMode mode) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!paused_) return;
+    step_mode_ = mode; step_depth_ = current_depth_; step_line_ = current_line_; step_file_ = current_file_;
+    pause_requested_ = false; paused_ = false;
     pause_cv_.notify_all();
 }
-
-void DebugSession::step_over() {
-    // Capture current position so op_handler knows when we've moved
-    step_start_depth_ = (int)frame_stack_.size();
-    step_start_line_ = frame_stack_.empty() ? 0 : frame_stack_.back().line;
-    step_start_file_ = frame_stack_.empty() ? "" : frame_stack_.back().filename;
-    step_mode_.store(StepMode::Over);
-    pause_requested_.store(false);
-    paused_.store(false);
-    pause_cv_.notify_all();
+void DebugSession::resume() { continue_with(StepMode::Continue); }
+void DebugSession::step_over() { continue_with(StepMode::Over); }
+void DebugSession::step_into() { continue_with(StepMode::Into); }
+void DebugSession::step_out() { continue_with(StepMode::Out); }
+void DebugSession::request_pause() { std::lock_guard<std::mutex> guard(mutex_); pause_requested_ = true; }
+void DebugSession::set_pause_on_start(bool enabled) {
+    std::lock_guard<std::mutex> guard(mutex_); pause_on_start_ = enabled; entry_pending_ = enabled;
 }
-
-void DebugSession::step_into() {
-    step_start_depth_ = (int)frame_stack_.size();
-    step_start_line_ = frame_stack_.empty() ? 0 : frame_stack_.back().line;
-    step_start_file_ = frame_stack_.empty() ? "" : frame_stack_.back().filename;
-    step_mode_.store(StepMode::Into);
-    pause_requested_.store(false);
-    paused_.store(false);
-    pause_cv_.notify_all();
-}
-
-void DebugSession::step_out() {
-    step_start_depth_ = (int)frame_stack_.size();
-    step_start_line_ = frame_stack_.empty() ? 0 : frame_stack_.back().line;
-    step_start_file_ = frame_stack_.empty() ? "" : frame_stack_.back().filename;
-    step_mode_.store(StepMode::Out);
-    pause_requested_.store(false);
-    paused_.store(false);
-    pause_cv_.notify_all();
-}
-
-void DebugSession::request_pause() {
-    pause_requested_.store(true);
-}
-
-// ============================================================
-// Wait for debugger
-// ============================================================
-
 void DebugSession::wait_for_debugger() {
-    if (!pause_on_start_) return;
-    waiting_.store(true);
-    std::unique_lock<std::mutex> lock(wait_mutex_);
-    wait_cv_.wait(lock, [this] { return !waiting_.load(); });
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> guard(mutex_);
+        if (!pause_on_start_) return;
+        start_cv_.wait(guard, [this] { return run_received_ || stopping_ || disconnected_; });
+    }
+    if (pause_observer_) pause_observer_(std::chrono::steady_clock::now() - start);
 }
-
 void DebugSession::run_if_waiting() {
-    // Set Continue mode so breakpoints are checked from the start
-    step_mode_.store(StepMode::Continue);
-    waiting_.store(false);
-    wait_cv_.notify_all();
+    std::lock_guard<std::mutex> guard(mutex_); run_received_ = true; start_cv_.notify_all();
 }
-
 void DebugSession::on_disconnect() {
-    // Unblock everything on disconnect
-    pause_requested_.store(false);
-    step_mode_.store(StepMode::Continue);
-    paused_.store(false);
-    pause_cv_.notify_all();
-    waiting_.store(false);
-    wait_cv_.notify_all();
+    std::lock_guard<std::mutex> guard(mutex_);
+    enabled_ = false; disconnected_ = true; paused_ = false; pause_requested_ = false; entry_pending_ = false;
+    step_mode_ = StepMode::Continue;
+    if (pending_) { pending_->result = error("Debugger detached"); pending_->done = true; pending_ = nullptr; }
+    pause_cv_.notify_all(); request_cv_.notify_all(); start_cv_.notify_all();
 }
-
-// ============================================================
-// JSValue → CDP RemoteObject
-// ============================================================
-
-json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
-                                                      const std::string& group) const {
-    std::map<void*, std::string> seen_objects;
-    return js_value_to_remote_object(ctx, val, group, seen_objects);
+void DebugSession::stop() { stopping_ = true; on_disconnect(); }
+void DebugSession::install_exception_handler(JSContext* ctx) { JS_SetDebugExceptionHandler(ctx, exception_handler, this); }
+void DebugSession::uninstall_exception_handler(JSContext* ctx) { JS_SetDebugExceptionHandler(ctx, nullptr, nullptr); }
+json::Value DebugSession::set_pause_on_exceptions(const std::string& policy) {
+    if (policy != "none" && policy != "all" && policy != "uncaught") return error("Unsupported exception policy");
+    std::lock_guard<std::mutex> guard(mutex_); exception_policy_ = policy; return json::Value::object();
 }
-
-json::Value DebugSession::js_value_to_remote_object(JSContext* ctx, JSValue val,
-                                                      const std::string& group,
-                                                      std::map<void*, std::string>& seen_objects) const {
-    auto obj = json::Value::object();
-
-    if (JS_IsUndefined(val)) {
-        obj.set("type", "undefined");
-    } else if (JS_IsNull(val)) {
-        obj.set("type", "object");
-        obj.set("subtype", "null");
-        obj.set("value", nullptr);
-    } else if (JS_IsBool(val)) {
-        bool b = JS_ToBool(ctx, val) != 0;
-        obj.set("type", "boolean");
-        obj.set("value", b);
-        obj.set("description", b ? "true" : "false");
-    } else if (JS_VALUE_GET_TAG(val) == JS_TAG_INT) {
-        int32_t v;
-        JS_ToInt32(ctx, &v, val);
-        obj.set("type", "number");
-        obj.set("value", v);
-        obj.set("description", std::to_string(v));
-    } else if (JS_IsNumber(val)) {
-        double v;
-        JS_ToFloat64(ctx, &v, val);
-        obj.set("type", "number");
-        obj.set("value", v);
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%.17g", v);
-        obj.set("description", std::string(buf));
-    } else if (JS_IsString(val)) {
-        const char* s = JS_ToCString(ctx, val);
-        if (s) {
-            obj.set("type", "string");
-            obj.set("value", s);
-            obj.set("description", std::string("\"") + s + "\"");
-            JS_FreeCString(ctx, s);
-        }
-    } else if (JS_IsFunction(ctx, val)) {
-        obj.set("type", "function");
-        obj.set("className", "Function");
-        obj.set("description", "function()");
-        // Store for later property access
-        auto props = json::Value::array();
-        std::string oid = store_object(group, props);
-        obj.set("objectId", oid);
-    } else if (JS_IsArray(val)) {
-        obj.set("type", "object");
-        obj.set("subtype", "array");
-        obj.set("className", "Array");
-
-        void* object_ptr = JS_VALUE_GET_PTR(val);
-        auto seen_it = seen_objects.find(object_ptr);
-        if (seen_it != seen_objects.end()) {
-            obj.set("description", "Array");
-            obj.set("objectId", seen_it->second);
-            return obj;
-        }
-
-        std::string oid = make_object_id();
-        seen_objects[object_ptr] = oid;
-        object_store_[oid] = json::Value::array();
-
-        // Get array length and elements
-        JSValue len_val = JS_GetPropertyStr(ctx, val, "length");
-        int32_t len = 0;
-        JS_ToInt32(ctx, &len, len_val);
-        JS_FreeValue(ctx, len_val);
-
-        obj.set("description", std::string("Array(") + std::to_string(len) + ")");
-
-        // Store array properties
-        auto props = json::Value::array();
-        for (int32_t i = 0; i < len && i < 100; i++) {
-            JSValue elem = JS_GetPropertyUint32(ctx, val, i);
-            auto prop = json::Value::object();
-            prop.set("name", std::to_string(i));
-            prop.set("value", js_value_to_remote_object(ctx, elem, group, seen_objects));
-            prop.set("writable", true);
-            prop.set("configurable", true);
-            prop.set("enumerable", true);
-            prop.set("isOwn", true);
-            props.push(prop);
-            JS_FreeValue(ctx, elem);
-        }
-        // Add length property
-        auto len_prop = json::Value::object();
-        len_prop.set("name", "length");
-        auto len_ro = json::Value::object();
-        len_ro.set("type", "number");
-        len_ro.set("value", (int)len);
-        len_ro.set("description", std::to_string(len));
-        len_prop.set("value", len_ro);
-        len_prop.set("writable", true);
-        len_prop.set("configurable", false);
-        len_prop.set("enumerable", false);
-        len_prop.set("isOwn", true);
-        props.push(len_prop);
-
-        object_store_[oid] = props;
-        obj.set("objectId", oid);
-    } else if (JS_IsObject(val)) {
-        obj.set("type", "object");
-        obj.set("className", "Object");
-
-        void* object_ptr = JS_VALUE_GET_PTR(val);
-        auto seen_it = seen_objects.find(object_ptr);
-        if (seen_it != seen_objects.end()) {
-            obj.set("description", "Object");
-            obj.set("objectId", seen_it->second);
-            return obj;
-        }
-
-        std::string oid = make_object_id();
-        seen_objects[object_ptr] = oid;
-        object_store_[oid] = json::Value::array();
-
-        // Get own property names
-        JSPropertyEnum* props_enum = nullptr;
-        uint32_t prop_count = 0;
-        auto props = json::Value::array();
-
-        if (JS_GetOwnPropertyNames(ctx, &props_enum, &prop_count, val,
-                JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
-            for (uint32_t i = 0; i < prop_count && i < 100; i++) {
-                JSValue pval = JS_GetProperty(ctx, val, props_enum[i].atom);
-                const char* pname = JS_AtomToCString(ctx, props_enum[i].atom);
-                if (pname) {
-                    auto prop = json::Value::object();
-                    prop.set("name", pname);
-                    prop.set("value", js_value_to_remote_object(ctx, pval, group, seen_objects));
-                    prop.set("writable", true);
-                    prop.set("configurable", true);
-                    prop.set("enumerable", true);
-                    prop.set("isOwn", true);
-                    props.push(prop);
-                    JS_FreeCString(ctx, pname);
-                }
-                JS_FreeValue(ctx, pval);
-            }
-            for (uint32_t i = 0; i < prop_count; i++)
-                JS_FreeAtom(ctx, props_enum[i].atom);
-            js_free(ctx, props_enum);
-        }
-
-        obj.set("description", "Object");
-        object_store_[oid] = props;
-        obj.set("objectId", oid);
-    } else {
-        obj.set("type", "undefined");
-    }
-
-    return obj;
+json::Value DebugSession::dispatch(std::function<json::Value(JSContext*)> operation) {
+    std::unique_lock<std::mutex> guard(mutex_);
+    if (!paused_ || stopping_ || !enabled_) return error("No active paused invocation");
+    if (pending_) return error("Debug inspection queue budget exceeded");
+    DebugRequest request; request.operation = std::move(operation); request.generation = generation_;
+    pending_ = &request; pause_cv_.notify_all();
+    request_cv_.wait(guard, [&] { return request.done; });
+    return request.result;
 }
-
-std::string DebugSession::make_object_id() const {
-    return "{\"ordinal\":" + std::to_string(next_obj_id_++) + ",\"injectedScriptId\":1}";
-}
-
-std::string DebugSession::store_object(const std::string& group, json::Value props) const {
-    std::string oid = make_object_id();
-    object_store_[oid] = std::move(props);
-    return oid;
-}
-
-// ============================================================
-// State capture (when pausing)
-// ============================================================
-
-void DebugSession::capture_frames(JSContext* ctx, const char* filename,
-                                    const char* funcname, int line, int col) {
-    int depth = JS_GetStackDepth(ctx);
-
-    // Update frame_stack_ from depth tracking
-    while ((int)frame_stack_.size() > depth) frame_stack_.pop_back();
-    while ((int)frame_stack_.size() < depth) frame_stack_.push_back(FrameInfo{});
-
-    if (!frame_stack_.empty()) {
-        auto& top = frame_stack_.back();
-        top.filename = filename ? filename : "";
-        top.funcname = funcname ? funcname : "";
-        top.line = line;
-        top.col = col;
-    }
-
-    // Clear old object store
-    object_store_.clear();
-    next_obj_id_ = 1;
-
-    // Build CDP call frames (innermost first)
-    auto frames = json::Value::array();
-    for (int i = (int)frame_stack_.size() - 1; i >= 0; i--) {
-        int level = (int)frame_stack_.size() - 1 - i; // level for JS_GetLocalVariablesAtLevel
-        const auto& fi = frame_stack_[i];
-
-        auto frame = json::Value::object();
-        frame.set("callFrameId", std::to_string(level));
-        frame.set("functionName", fi.funcname.empty() ? "(anonymous)" : fi.funcname);
-
-        // Location
-        std::string sid = find_script_id(fi.filename);
-        auto location = json::Value::object();
-        location.set("scriptId", sid);
-        location.set("lineNumber", fi.line > 0 ? fi.line - 1 : 0); // 0-based for CDP
-        location.set("columnNumber", fi.col > 0 ? fi.col - 1 : 0);
-        frame.set("location", location);
-        frame.set("url", to_file_url(fi.filename));
-
-        // Scope chain
-        auto scope_chain = json::Value::array();
-
-        // Local scope - capture variables using QuickJS API
-        int var_count = 0;
-        JSDebugLocalVar* vars = nullptr;
-        int ret = JS_GetLocalVariablesAtLevel(ctx, level, &vars, &var_count);
-        if (ret < 0) {
-            // Failed to get variables - continue with empty scope
-            vars = nullptr;
-            var_count = 0;
-        }
-        
-        if (vars && var_count > 0) {
-            auto local_props = json::Value::array();
-            auto closure_props = json::Value::array();
-            for (int v = 0; v < var_count; v++) {
-                auto prop = json::Value::object();
-                prop.set("name", vars[v].name ? vars[v].name : "");
-                prop.set("value", js_value_to_remote_object(ctx, vars[v].value, "scope"));
-                prop.set("writable", true);
-                prop.set("configurable", true);
-                prop.set("enumerable", true);
-                prop.set("isOwn", true);
-                if (vars[v].is_closure) {
-                    closure_props.push(prop);
-                } else {
-                    local_props.push(prop);
-                }
-            }
-            JS_FreeLocalVariables(ctx, vars, var_count);
-
-            // Local scope
-            {
-                std::string scope_oid = store_object("scope", local_props);
-                auto local_scope = json::Value::object();
-                local_scope.set("type", "local");
-                auto scope_obj = json::Value::object();
-                scope_obj.set("type", "object");
-                scope_obj.set("className", "Object");
-                scope_obj.set("objectId", scope_oid);
-                local_scope.set("object", scope_obj);
-                local_scope.set("name", fi.funcname.empty() ? "(anonymous)" : fi.funcname);
-                scope_chain.push(local_scope);
-            }
-
-            // Closure scope (captured variables from enclosing functions)
-            if (closure_props.size() > 0) {
-                std::string scope_oid = store_object("scope", closure_props);
-                auto closure_scope = json::Value::object();
-                closure_scope.set("type", "closure");
-                auto cobj = json::Value::object();
-                cobj.set("type", "object");
-                cobj.set("className", "Object");
-                cobj.set("objectId", scope_oid);
-                closure_scope.set("object", cobj);
-                closure_scope.set("name", fi.funcname.empty() ? "(anonymous)" : fi.funcname);
-                scope_chain.push(closure_scope);
-            }
-        }
-
-        // Global scope
-        {
-            JSValue global = JS_GetGlobalObject(ctx);
-            auto global_props = json::Value::array();
-
-            JSPropertyEnum* gprops = nullptr;
-            uint32_t gprop_count = 0;
-            if (JS_GetOwnPropertyNames(ctx, &gprops, &gprop_count, global,
-                    JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
-                for (uint32_t g = 0; g < gprop_count && g < 50; g++) {
-                    JSValue gval = JS_GetProperty(ctx, global, gprops[g].atom);
-                    const char* gname = JS_AtomToCString(ctx, gprops[g].atom);
-                    if (gname) {
-                        auto gprop = json::Value::object();
-                        gprop.set("name", gname);
-                        gprop.set("value", js_value_to_remote_object(ctx, gval, "global"));
-                        gprop.set("writable", true);
-                        gprop.set("configurable", true);
-                        gprop.set("enumerable", true);
-                        gprop.set("isOwn", true);
-                        global_props.push(gprop);
-                        JS_FreeCString(ctx, gname);
-                    }
-                    JS_FreeValue(ctx, gval);
-                }
-                for (uint32_t g = 0; g < gprop_count; g++)
-                    JS_FreeAtom(ctx, gprops[g].atom);
-                js_free(ctx, gprops);
-            }
-            JS_FreeValue(ctx, global);
-
-            std::string global_oid = store_object("global", global_props);
-
-            auto global_scope = json::Value::object();
-            global_scope.set("type", "global");
-            auto gobj = json::Value::object();
-            gobj.set("type", "object");
-            gobj.set("className", "Object");
-            gobj.set("objectId", global_oid);
-            global_scope.set("object", gobj);
-            scope_chain.push(global_scope);
-        }
-
-        frame.set("scopeChain", scope_chain);
-
-        // this
-        auto this_obj = json::Value::object();
-        this_obj.set("type", "object");
-        this_obj.set("className", "global");
-        frame.set("this", this_obj);
-
-        frames.push(frame);
-    }
-
-    captured_frames_ = frames;
-}
-
-// ============================================================
-// Pause logic
-// ============================================================
-
-void DebugSession::do_pause(JSContext* ctx, const char* filename,
-                              const char* funcname, int line, int col,
-                              PauseReason reason, int bp_id) {
-    // Capture state
-    capture_frames(ctx, filename, funcname, line, col);
-
-    paused_.store(true);
-
-    // Build Debugger.paused event
-    auto params = json::Value::object();
-    params.set("callFrames", captured_frames_);
-
-    switch (reason) {
-    case PauseReason::Breakpoint: {
-        params.set("reason", "breakpoint");
-        auto hit_bps = json::Value::array();
-        if (bp_id > 0) {
-            hit_bps.push(std::to_string(bp_id) + ":" + std::to_string(line - 1) + ":0");
-        }
-        params.set("hitBreakpoints", hit_bps);
-        break;
-    }
-    case PauseReason::Step:
-        params.set("reason", "step");
-        params.set("hitBreakpoints", json::Value::array());
-        break;
-    case PauseReason::PauseRequest:
-        params.set("reason", "pause");
-        params.set("hitBreakpoints", json::Value::array());
-        break;
-    case PauseReason::Entry:
-        params.set("reason", "Break on start");
-        params.set("hitBreakpoints", json::Value::array());
-        break;
-    case PauseReason::DebuggerStatement:
-        // CDP reason name for `debugger` keyword
-        params.set("reason", "debugCommand");
-        params.set("hitBreakpoints", json::Value::array());
-        break;
-    }
-
-    if (send_event_) {
-        send_event_("Debugger.paused", params);
-    }
-
-    // Store JSContext for evaluate-while-paused
-    paused_ctx_ = ctx;
-
-    // Block until resumed, but wake up to process eval requests
-    {
-        std::unique_lock<std::mutex> lock(pause_mutex_);
-        while (paused_.load()) {
-            pause_cv_.wait(lock, [this] {
-                return !paused_.load()
-                    || pending_eval_ != nullptr
-                    || pending_setvar_ != nullptr;
-            });
-
-            // Process pending eval request if any
-            if (paused_.load() && pending_eval_ != nullptr) {
-                std::lock_guard<std::mutex> eval_lock(eval_mutex_);
-                if (pending_eval_) {
-                    int frame_level = 0;
-                    try { frame_level = std::stoi(pending_eval_->call_frame_id); } catch (...) {}
-
-                    JSValue eval_val = JS_EvalInStackFrame(ctx,
-                        frame_level,
-                        pending_eval_->expression.c_str(),
-                        pending_eval_->expression.size(),
-                        "<debugger-eval>");
-
-                    if (JS_IsException(eval_val)) {
-                        JSValue exc = JS_GetException(ctx);
-                        const char* exc_str = JS_ToCString(ctx, exc);
-                        auto err_result = json::Value::object();
-                        auto err_obj = json::Value::object();
-                        err_obj.set("type", "object");
-                        err_obj.set("subtype", "error");
-                        err_obj.set("className", "Error");
-                        err_obj.set("description", exc_str ? exc_str : "Error");
-                        if (exc_str) JS_FreeCString(ctx, exc_str);
-                        JS_FreeValue(ctx, exc);
-                        err_result.set("result", err_obj);
-                        err_result.set("exceptionDetails", json::Value::object());
-                        pending_eval_->result = err_result;
-                    } else {
-                        pending_eval_->result = json::Value::object();
-                        pending_eval_->result.set("result",
-                            js_value_to_remote_object(ctx, eval_val, "console"));
-                    }
-                    JS_FreeValue(ctx, eval_val);
-
-                    pending_eval_->ready = true;
-                    eval_done_cv_.notify_all();
-                }
-            }
-
-            // Process pending set-variable request if any
-            if (paused_.load() && pending_setvar_ != nullptr) {
-                std::lock_guard<std::mutex> eval_lock(eval_mutex_);
-                if (pending_setvar_) {
-                    JSValue new_val = JS_EvalInStackFrame(ctx,
-                        pending_setvar_->call_frame_level,
-                        pending_setvar_->value_expr.c_str(),
-                        pending_setvar_->value_expr.size(),
-                        "<debugger-setvar>");
-                    if (JS_IsException(new_val)) {
-                        JSValue exc = JS_GetException(ctx);
-                        const char* exc_str = JS_ToCString(ctx, exc);
-                        auto err = json::Value::object();
-                        err.set("code", -32000);
-                        err.set("message",
-                            exc_str ? std::string("Failed to evaluate new value: ") + exc_str
-                                    : std::string("Failed to evaluate new value"));
-                        if (exc_str) JS_FreeCString(ctx, exc_str);
-                        JS_FreeValue(ctx, exc);
-                        auto wrap = json::Value::object();
-                        wrap.set("error", err);
-                        pending_setvar_->result = wrap;
-                    } else {
-                        int rc = JS_SetVariableAtLevel(ctx,
-                            pending_setvar_->call_frame_level,
-                            pending_setvar_->name.c_str(),
-                            new_val);
-                        // JS_SetVariableAtLevel takes ownership of `new_val`.
-                        if (rc == 0) {
-                            pending_setvar_->result = json::Value::object();
-                        } else {
-                            auto err = json::Value::object();
-                            err.set("code", -32000);
-                            if (rc == -1)
-                                err.set("message",
-                                    std::string("Variable '") + pending_setvar_->name + "' not found");
-                            else if (rc == -2)
-                                err.set("message",
-                                    std::string("Variable '") + pending_setvar_->name + "' is const");
-                            else
-                                err.set("message", std::string("Failed to set variable"));
-                            auto wrap = json::Value::object();
-                            wrap.set("error", err);
-                            pending_setvar_->result = wrap;
-                        }
-                    }
-                    pending_setvar_->ready = true;
-                    eval_done_cv_.notify_all();
-                }
-            }
-        }
-    }
-
-    paused_ctx_ = nullptr;
-
-    // Send resumed event
-    if (send_event_) {
-        send_event_("Debugger.resumed", json::Value::object());
-    }
-}
-
 json::Value DebugSession::get_call_frames_json() const {
-    return captured_frames_;
+    std::lock_guard<std::mutex> guard(mutex_); return paused_ ? captured_frames_ : json::Value::array();
 }
-
-json::Value DebugSession::get_properties(const std::string& object_id) const {
-    auto it = object_store_.find(object_id);
-    if (it != object_store_.end()) {
-        auto result = json::Value::object();
-        result.set("result", it->second);
-        return result;
-    }
-    // Return empty result
-    auto result = json::Value::object();
-    result.set("result", json::Value::array());
-    return result;
+void DebugSession::clear_pause(JSContext* ctx) {
+    for (auto& scope : scopes_) for (auto& binding : scope.bindings) JS_FreeValue(ctx, binding.value);
+    for (auto& object : objects_) JS_FreeValue(ctx, object.second.value);
+    scopes_.clear(); frames_.clear(); objects_.clear(); object_ids_.clear(); captured_frames_ = json::Value::array();
+    handle_count_ = 0; next_object_ = 1; preview_bytes_ = 0;
 }
-
-json::Value DebugSession::evaluate_on_call_frame(const std::string& call_frame_id,
-                                                   const std::string& expression) {
-    if (!paused_.load()) {
-        auto r = json::Value::object();
-        auto ro = json::Value::object();
-        ro.set("type", "undefined");
-        r.set("result", ro);
-        return r;
+void DebugSession::capture_frames(JSContext* ctx, const std::string& filename, const std::string& function, int line, int column) {
+    clear_pause(ctx); ++generation_;
+    JSValue plain = JS_NewObject(ctx), array = JS_NewArray(ctx);
+    if (JS_IsException(plain) || JS_IsException(array)) {
+        JS_FreeValue(ctx, plain); JS_FreeValue(ctx, array);
+        throw std::runtime_error("Debug object classification allocation failed");
     }
-
-    // Post request to JS thread
-    EvalRequest req;
-    req.expression = expression;
-    req.call_frame_id = call_frame_id;
-    req.ready = false;
-
-    {
-        std::lock_guard<std::mutex> lock(eval_mutex_);
-        pending_eval_ = &req;
-    }
-
-    // Wake up the JS thread (which is waiting in do_pause)
-    pause_cv_.notify_all();
-
-    // Wait for JS thread to fill in the result
-    {
-        std::unique_lock<std::mutex> lock(eval_mutex_);
-        eval_done_cv_.wait(lock, [&req] { return req.ready; });
-        pending_eval_ = nullptr;
-    }
-
-    return req.result;
-}
-
-// ============================================================
-// Debug Trace Handler
-// ============================================================
-//
-int DebugSession::debug_trace_handler(JSContext *ctx,
-                               JSAtom filename, JSAtom funcname,
-                               int line, int col,
-                               int flags,
-                               void *opaque) {
-
-    auto* self = static_cast<DebugSession*>(opaque);
-    if (!self->enabled_.load()) return 0;
-    if (line <= 0) return 0;
-
-    // Convert atoms to C strings (valid only for the duration of this callback)
-    const char *filename_str = JS_AtomToCString(ctx, filename);
-    const char *funcname_str = JS_AtomToCString(ctx, funcname);
-
-    // RAII guard ensures strings are freed on all return paths
-    struct Guard {
-        JSContext *ctx;
-        const char *a, *b;
-        ~Guard() {
-            if (a) JS_FreeCString(ctx, a);
-            if (b) JS_FreeCString(ctx, b);
+    object_class_ = JS_GetClassID(plain); array_class_ = JS_GetClassID(array);
+    JS_FreeValue(ctx, plain); JS_FreeValue(ctx, array);
+    captured_frames_ = json::Value::array();
+    const int depth = std::min(JS_GetStackDepth(ctx), 64);
+    for (int level = 0; level < depth; ++level) {
+        JSAtom file = JS_ATOM_NULL, name = JS_ATOM_NULL; int frame_line = 0, frame_col = 0;
+        if (JS_GetDebugFrame(ctx, level, &file, &name, &frame_line, &frame_col) < 0) continue;
+        std::string frame_file = atom_text(ctx, file), frame_name = atom_text(ctx, name);
+        if (level == 0) { frame_file = filename; frame_name = function; frame_line = line; frame_col = column; }
+        DebugFrame frame; frame.id = std::to_string(generation_) + ":" + std::to_string(level);
+        auto chain = json::Value::array();
+        JSDebugLocalVar* vars = nullptr; int count = 0;
+        if (JS_GetLocalVariablesAtLevel(ctx, level, &vars, &count) < 0) { JS_FreeValue(ctx, JS_GetException(ctx)); count = 0; }
+        // Preserve lexical scope identity; innermost lexical scopes precede outer scopes.
+        std::map<std::pair<bool, int>, std::vector<int>> groups;
+        for (int i = 0; i < count && i < 2048; ++i) groups[{vars[i].is_closure, -vars[i].scope_level}].push_back(i);
+        for (const auto& group : groups) {
+            if (handle_count_ >= 2048) break;
+            DebugScope scope; scope.frame = level; scope.type = group.first.first ? "closure" : "local";
+            scope.lexical_level = -group.first.second;
+            scope.id = "scope:" + std::to_string(generation_) + ":" + std::to_string(scopes_.size());
+            ++handle_count_;
+            for (int i : group.second) {
+                if (handle_count_ >= 2048) break;
+                const auto& var = vars[i];
+                DebugBinding binding; binding.name = var.name ? var.name : ""; binding.value = JS_DupValue(ctx, var.value);
+                binding.slot = var.binding_index; binding.writable = var.is_writable; binding.initialized = var.is_initialized;
+                scope.bindings.push_back(std::move(binding)); ++handle_count_;
+            }
+            auto item = json::Value::object(), object = json::Value::object();
+            object.set("type", "object").set("className", "Object").set("objectId", scope.id);
+            item.set("type", scope.type).set("object", object).set("name", frame_name);
+            chain.push(item); frame.scopes.push_back(scopes_.size()); scopes_.push_back(std::move(scope));
         }
-    } guard{ctx, filename_str, funcname_str};
-
-    if (!filename_str) return 0;
-
-    printf("---->[DBG] Trace: %s:%d in %s\n", filename_str, line, funcname_str ? funcname_str : "(anonymous)");
-
-    int depth = JS_GetStackDepth(ctx);
-
-    // Update frame stack tracking
-    while ((int)self->frame_stack_.size() > depth) self->frame_stack_.pop_back();
-    while ((int)self->frame_stack_.size() < depth) self->frame_stack_.push_back(FrameInfo{});
-    if (!self->frame_stack_.empty()) {
-        auto& top = self->frame_stack_.back();
-        top.filename = filename_str ? filename_str : "";
-        top.funcname = funcname_str ? funcname_str : "";
-        top.line = line;
-        top.col = col;
+        if (vars) JS_FreeLocalVariables(ctx, vars, count);
+        auto result = json::Value::object(), location = json::Value::object(), receiver = json::Value::object();
+        const auto script_id = find_script_id(frame_file);
+        const auto* source = get_script_by_id(script_id);
+        location.set("scriptId", script_id).set("lineNumber", std::max(0, frame_line - 1)).set("columnNumber", std::max(0, frame_col - 1));
+        receiver.set("type", "undefined");
+        result.set("callFrameId", frame.id).set("functionName", frame_name).set("location", location)
+            .set("url", source ? source->url : to_file_url(frame_file)).set("scopeChain", chain).set("this", receiver);
+        captured_frames_.push(result); frames_.push_back(std::move(frame));
     }
-
-    StepMode mode = self->step_mode_.load();
-
-    // Check for pause request
-    if (self->pause_requested_.load()) {
-        self->pause_requested_.store(false);
-        self->step_mode_.store(StepMode::None);
-        self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::PauseRequest, 0);
-        return 0;
+}
+void DebugSession::do_pause(JSContext* ctx, const std::string& file, const std::string& name,
+        int line, int column, PauseReason reason, int breakpoint, JSValueConst exception) {
+    const auto start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> guard(mutex_);
+    if (!enabled_ || stopping_) return;
+    capture_frames(ctx, file, name, line, column);
+    current_depth_ = JS_GetStackDepth(ctx); current_line_ = line; current_file_ = file; paused_ = true;
+    auto params = json::Value::object(), hits = json::Value::array();
+    const char* reasons[] = {"breakpoint", "step", "pause", "Break on start", "debugCommand", "exception"};
+    params.set("reason", reasons[static_cast<int>(reason)]).set("callFrames", captured_frames_);
+    if (breakpoint) hits.push(std::to_string(breakpoint));
+    params.set("hitBreakpoints", hits);
+    if (reason == PauseReason::Exception) params.set("data", remote(ctx, exception));
+    guard.unlock();
+    if (send_event_) send_event_("Debugger.paused", params);
+    guard.lock();
+    while (paused_ && !stopping_) {
+        pause_cv_.wait(guard, [this] { return !paused_ || stopping_ || pending_; });
+        if (pending_) {
+            auto* request = pending_;
+            if (paused_ && request->generation == generation_) {
+                preview_bytes_ = 0;
+                try { request->result = request->operation(ctx); }
+                catch (const std::exception& e) { JS_FreeValue(ctx, JS_GetException(ctx)); request->result = error(e.what()); }
+                catch (...) { JS_FreeValue(ctx, JS_GetException(ctx)); request->result = error("Debug inspection failed"); }
+            } else request->result = error("Stale paused request");
+            request->done = true; pending_ = nullptr; request_cv_.notify_all();
+        }
     }
-
-    // Check for entry breakpoint (first instruction)
-    if (self->pause_on_start_) {
-        self->pause_on_start_ = false;
-        self->step_mode_.store(StepMode::None);
-        self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Entry, 0);
-        return 0;
-    }
-
-    // Check breakpoints (in all modes)
-    if (self->check_breakpoint(filename_str, line)) {
-        // Find which breakpoint
-        int bp_id = 0;
+    if (pending_) { pending_->result = error("Invocation resumed"); pending_->done = true; pending_ = nullptr; request_cv_.notify_all(); }
+    clear_pause(ctx); paused_ = false;
+    guard.unlock();
+    if (pause_observer_) pause_observer_(std::chrono::steady_clock::now() - start);
+    if (send_event_) send_event_("Debugger.resumed", json::Value::object());
+}
+int DebugSession::debug_trace_handler(JSContext* ctx, JSAtom filename, JSAtom funcname, int line, int col, int flags, void* opaque) {
+    auto* self = static_cast<DebugSession*>(opaque);
+    if (!self || !self->enabled_ || self->stopping_ || line <= 0) return 0;
+    try {
+        const auto file = atom_text(ctx, filename), name = atom_text(ctx, funcname);
+        const auto depth = JS_GetStackDepth(ctx);
+        PauseReason reason = PauseReason::Step; bool pause = false; int bp = 0;
         {
-            std::lock_guard<std::mutex> lock(self->bp_mutex_);
-            std::string norm = normalize_url(filename_str);
-            std::string furl = to_file_url(norm);
-            std::string base = norm;
-            auto p = base.rfind('/');
-            if (p != std::string::npos) base = base.substr(p + 1);
-            for (const auto& [id, bp] : self->breakpoints_) {
-                if (bp.line == line && bp.enabled) {
-                    if (bp.is_regex) {
-                        try {
-                            std::regex re(bp.url, std::regex_constants::ECMAScript | std::regex_constants::icase);
-                            if (std::regex_search(furl, re) || std::regex_search(norm, re)) {
-                                bp_id = id;
-                                break;
-                            }
-                        } catch (...) {}
-                    }
-                    std::string bp_base = bp.url;
-                    auto bpos = bp_base.rfind('/');
-                    if (bpos != std::string::npos) bp_base = bp_base.substr(bpos + 1);
-                    if (paths_match(norm, bp.url) || paths_match(base, bp_base) ||
-                        to_lower(norm).find(to_lower(bp.url)) != std::string::npos ||
-                        to_lower(bp.url).find(to_lower(norm)) != std::string::npos) {
-                        bp_id = id;
-                        break;
-                    }
+            std::lock_guard<std::mutex> guard(self->mutex_);
+            if (self->entry_pending_) { self->entry_pending_ = false; reason = PauseReason::Entry; pause = true; }
+            else if (flags & JS_DEBUG_TRACE_DEBUGGER_STMT) { reason = PauseReason::DebuggerStatement; pause = true; }
+            else if (self->pause_requested_) { self->pause_requested_ = false; reason = PauseReason::PauseRequest; pause = true; }
+            else if ((self->step_mode_ == StepMode::Into && (file != self->step_file_ || line != self->step_line_ || depth != self->step_depth_))
+                || (self->step_mode_ == StepMode::Over && depth <= self->step_depth_ && (file != self->step_file_ || line != self->step_line_ || depth < self->step_depth_))
+                || (self->step_mode_ == StepMode::Out && depth < self->step_depth_)) pause = true;
+            else if (self->breakpoints_active_) for (const auto& item : self->breakpoints_) {
+                const auto& point = item.second;
+                if (point.line == line && (same_path(point.url, normalize_url(file)) || point.script_id == self->find_script_id(file))) {
+                    reason = PauseReason::Breakpoint; pause = true; bp = point.id; break;
                 }
             }
         }
-        self->step_mode_.store(StepMode::None);
-        self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Breakpoint, bp_id);
-        return 0;
+        if (pause) self->do_pause(ctx, file, name, line, col, reason, bp);
+    } catch (...) {
+        self->on_disconnect();
+        std::lock_guard<std::mutex> guard(self->mutex_);
+        self->clear_pause(ctx);
+        JS_FreeValue(ctx, JS_GetException(ctx));
     }
-
-    // Handle step modes
-    switch (mode) {
-    case StepMode::None:
-    case StepMode::Continue:
-        break;
-
-    case StepMode::Into:
-        // Pause on the next line/statement
-        if (line != self->step_start_line_ ||
-            (filename_str && self->step_start_file_ != filename_str)) {
-            self->step_mode_.store(StepMode::None);
-            self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Step, 0);
-        }
-        break;
-
-    case StepMode::Over:
-        // Pause on next line at the same or lower depth
-        if (depth <= self->step_start_depth_) {
-            if (line != self->step_start_line_ ||
-                (filename_str && self->step_start_file_ != filename_str)) {
-                self->step_mode_.store(StepMode::None);
-                self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Step, 0);
-            }
-        }
-        break;
-
-    case StepMode::Out:
-        // Pause when we return to a lower depth
-        if (depth < self->step_start_depth_) {
-            self->step_mode_.store(StepMode::None);
-            self->do_pause(ctx, filename_str, funcname_str, line, col, PauseReason::Step, 0);
-        }
-        break;
-
-    default:
-        break;
-    }
-
-    // `debugger` statement: the parser emits a dedicated OP_debugger_stmt
-    // opcode, so the runtime can flag it explicitly via JS_DEBUG_TRACE_DEBUGGER_STMT.
-    if (flags & JS_DEBUG_TRACE_DEBUGGER_STMT) {
-        self->step_mode_.store(StepMode::None);
-        self->do_pause(ctx, filename_str, funcname_str, line, col,
-                       PauseReason::DebuggerStatement, 0);
-        return 0;
-    }
-
     return 0;
+}
+void DebugSession::exception_handler(JSContext* ctx, JSValueConst exception, bool caught, void* opaque) {
+    auto* self = static_cast<DebugSession*>(opaque);
+    if (!self || !self->enabled_ || self->stopping_) return;
+    {
+        std::lock_guard<std::mutex> guard(self->mutex_);
+        if (self->exception_policy_ == "none" || (self->exception_policy_ == "uncaught" && caught)) return;
+    }
+    try {
+        JSAtom file = JS_ATOM_NULL, name = JS_ATOM_NULL; int line = 0, col = 0;
+        JS_GetDebugFrame(ctx, 0, &file, &name, &line, &col);
+        self->do_pause(ctx, atom_text(ctx, file), atom_text(ctx, name), line, col, PauseReason::Exception, 0, exception);
+    } catch (...) {
+        self->on_disconnect();
+        std::lock_guard<std::mutex> guard(self->mutex_);
+        self->clear_pause(ctx);
+    }
 }
